@@ -581,7 +581,8 @@ PASSIVE_SOURCES = [
 ]
 
 
-def run_passive_sources(domain, insecure=False, no_ct=False, max_workers=DEFAULT_WORKERS):
+def run_passive_sources(domain, insecure=False, no_ct=False, max_workers=DEFAULT_WORKERS,
+                        statuses=None):
     """Query every passive source in parallel. Returns dict name -> set of
     source tags that reported it. Logs each source clearly; one dead source
     never stops the run."""
@@ -591,6 +592,8 @@ def run_passive_sources(domain, insecure=False, no_ct=False, max_workers=DEFAULT
     def run_source(tag, func):
         if tag in CT_SOURCES and no_ct:
             print(f"[passive] {tag}: skipped (--no-ct)")
+            if statuses is not None:
+                statuses[tag] = {"status": "skipped", "error": "--no-ct"}
             return
         try:
             names, err = func(domain, insecure=insecure)
@@ -599,8 +602,12 @@ def run_passive_sources(domain, insecure=False, no_ct=False, max_workers=DEFAULT
         with lock:
             if err:
                 print(f"[passive] {tag}: FAILED - {err}")
+                if statuses is not None:
+                    statuses[tag] = {"status": "failed", "error": str(err)}
             else:
                 print(f"[passive] {tag}: OK - {len(names)} name(s)")
+                if statuses is not None:
+                    statuses[tag] = {"status": "ok", "count": len(names)}
                 for nn in names:
                     results[nn].add(tag)
 
@@ -779,6 +786,7 @@ def analyze_website(hostname, domain, insecure=False):
     tuples derived from nav anchors, buttons, headings and URL slugs.
     """
     hostnames = set()
+    external_domains = set()
     entity_texts = []
     keywords = defaultdict(int)
     base = "https://{0}".format(hostname)
@@ -801,6 +809,16 @@ def analyze_website(hostname, domain, insecure=False):
             h = normalize_name(p.hostname or "")
             if h and is_in_scope(h, domain):
                 hostnames.add(h)
+            elif h and p.scheme in ("http", "https") and "." in h:
+                # Keep external company/product domains as related leads; do not
+                # validate or crawl them from this in-scope investigation.
+                if not any(x in h for x in ("facebook.com", "linkedin.com", "twitter.com", "instagram.com", "youtube.com")):
+                    external_domains.add(h)
+            if h == normalize_name(hostname) and p.scheme in ("http", "https"):
+                clean_url = p._replace(fragment="").geturl()
+                if (clean_url not in visited and clean_url not in to_crawl and
+                        not re.search(r"\.(?:pdf|png|jpe?g|gif|svg|css|js|zip|mp4|woff2?)$", p.path, re.I)):
+                    to_crawl.append(clean_url)
             if p.path.lower().endswith(".js"):
                 if abs_url not in js_seen:
                     js_seen.add(abs_url)
@@ -814,35 +832,49 @@ def analyze_website(hostname, domain, insecure=False):
         if body is not None:
             handle_html(body, url)
 
-    fetch_and_handle(base + "/")
-    visited.add(base + "/")
+    # Homepage is consumed by the same queue as every other page so its links
+    # are actually enqueued and deeply nested product/docs links are reachable.
 
+    disallowed_paths = set()
     body = _fetch_text(base + "/robots.txt", insecure)
     if body:
-        for m in re.finditer(r"(?:Allow|Disallow):\s*(\S+)", body, re.I):
-            abs_url = urljoin(base, m.group(1))
-            p = urlparse(abs_url)
-            h = normalize_name(p.hostname or "")
-            if h and is_in_scope(h, domain):
-                hostnames.add(h)
+        for m in re.finditer(r"Disallow:\s*(\S+)", body, re.I):
+            disallowed_paths.add(m.group(1))
 
-    body = _fetch_text(base + "/sitemap.xml", insecure)
+    sitemap_urls = [base + "/sitemap.xml"]
     if body:
-        for m in re.finditer(r"<loc>\s*(https?://[^<]+?)\s*</loc>", body, re.I | re.S):
-            p = urlparse(m.group(1))
+        sitemap_urls.extend(urljoin(base + "/", x) for x in re.findall(r"(?im)^Sitemap:\s*(\S+)", body))
+    sitemap_seen = set()
+    while sitemap_urls and len(sitemap_seen) < 20:
+        sitemap_url = sitemap_urls.pop(0)
+        if sitemap_url in sitemap_seen:
+            continue
+        sitemap_seen.add(sitemap_url)
+        xml = _fetch_text(sitemap_url, insecure)
+        if not xml:
+            continue
+        for loc in re.findall(r"<loc>\s*([^<]+?)\s*</loc>", xml, re.I | re.S):
+            loc = html_module.unescape(loc.strip())
+            p = urlparse(loc)
             h = normalize_name(p.hostname or "")
             if h and is_in_scope(h, domain):
                 hostnames.add(h)
+                if p.path.lower().endswith(".xml"):
+                    sitemap_urls.append(loc)
+                elif h == normalize_name(hostname) and loc not in to_crawl:
+                    to_crawl.append(loc)
 
     crawled = 0
-    while to_crawl and crawled < 10:
+    while to_crawl and crawled < 40:
         url = to_crawl.popleft()
         if url in visited:
             continue
-        visited.add(url)
         p = urlparse(url)
         if normalize_name(p.hostname or "") != normalize_name(hostname):
             continue
+        if any(path and path != "/" and p.path.startswith(path) for path in disallowed_paths):
+            continue
+        visited.add(url)
         body = _fetch_text(url, insecure)
         if body is None:
             continue
@@ -878,7 +910,7 @@ def analyze_website(hostname, domain, insecure=False):
                 slug_texts.append(seg)
 
     entities = derive_entities(entity_texts + slug_texts)
-    return sorted(hostnames), entities, keywords
+    return sorted(hostnames), entities, keywords, sorted(external_domains)
 
 
 def derive_entities(texts):
@@ -1078,6 +1110,7 @@ class Engine:
         self.nodes = {}
         # name -> lead dict (UNVERIFIED)
         self.leads = {}
+        self.external_domains = {}
         # pending observations awaiting validation
         self.pending = {}
         self.order = []
@@ -1130,7 +1163,7 @@ class Engine:
             if name in self.nodes:
                 node = self.nodes[name]
                 node["origin"] = sorted(set(node["origin"]) | set(origin))
-                seen = set(d[0] for d in node["evidence"])
+                seen = set(tuple(d) for d in node["evidence"])
                 for s, d in details:
                     if (s, d) not in seen:
                         node["evidence"].append((s, d))
@@ -1151,7 +1184,7 @@ class Engine:
             if name in self.leads:
                 lead = self.leads[name]
                 lead["origin"] = sorted(set(lead["origin"]) | set(rec["sources"]))
-                seen = set(d[0] for d in lead["evidence"])
+                seen = set(tuple(d) for d in lead["evidence"])
                 for s, d in rec["details"]:
                     if (s, d) not in seen:
                         lead["evidence"].append((s, d))
@@ -1292,8 +1325,10 @@ class Engine:
 
         # ---- depth 0: passive sources (%.root) ----
         if not args.no_ct:
+            source_status = self.stats.setdefault("source_status", {})
             passive = run_passive_sources(domain, insecure=self.insecure,
-                                          no_ct=args.no_ct, max_workers=args.workers)
+                                          no_ct=args.no_ct, max_workers=args.workers,
+                                          statuses=source_status)
             for name, srcs in passive.items():
                 explicit = bool(srcs & EXPLICIT_SOURCES)
                 parent = self._nearest_validated_ancestor(name)
@@ -1303,6 +1338,10 @@ class Engine:
                                  explicit=explicit)
         else:
             print("[passive] certificate-transparency sources skipped (--no-ct)")
+            self.stats["source_status"] = {
+                name: {"status": "skipped", "error": "--no-ct"}
+                for name, _func in PASSIVE_SOURCES if name in CT_SOURCES
+            }
 
         try:
             self.validate_pending()
@@ -1344,7 +1383,7 @@ class Engine:
             # Website analysis
             if not args.no_web:
                 try:
-                    whosts, entities, _keywords = analyze_website(host, domain,
+                    whosts, entities, _keywords, externals = analyze_website(host, domain,
                                                                   insecure=self.insecure)
                     print(f"[web] {host}: {len(whosts)} hostnames, {len(entities)} entities")
                     if entities:
@@ -1354,6 +1393,14 @@ class Engine:
                         self.observe(h, parent=host, source="website",
                                      detail="website HTML/JS hostname",
                                      explicit=True)
+                    for ext in externals:
+                        rec = self.external_domains.setdefault(ext, {
+                            "hostname": ext, "related_to": host, "source": "website link",
+                            "evidence": [], "first_seen": now_iso()})
+                        evidence = {"source": "website link", "detail": "linked from {0}".format(host),
+                                    "observed_at": now_iso()}
+                        if evidence not in rec["evidence"]:
+                            rec["evidence"].append(evidence)
                     for joined, hyphenated in entities:
                         for cand in (joined, hyphenated):
                             nn = normalize_name("{0}.{1}".format(cand, host))
@@ -1501,21 +1548,24 @@ class Engine:
     # -- reporting ----------------------------------------------------------
     def _build_report(self):
         domain = self.domain
+        report_time = now_iso()
         tree_lines = self._render_validated_tree(
             annotate=bool(getattr(self.args, "annotate", False)))
         report = {
             "root": domain,
-            "timestamp": now_iso(),
+            "timestamp": report_time,
             "stats": dict(self.stats),
             "tree": tree_lines,
             "validated_assets": [],
             "unverified_leads": [],
+            "external_related_domains": [],
             "shared_infrastructure": [],
             "learned_patterns": {
                 "roles": self.stats.get("learned_roles", []),
                 "products": self.stats.get("learned_products", []),
             },
             "sources": self.stats["sources"],
+            "source_status": self.stats.get("source_status", {}),
             "origin_stats": {k: dict(v) for k, v in self.origin_stats.items()},
         }
         with self.lock:
@@ -1523,22 +1573,26 @@ class Engine:
                 node = self.nodes[name]
                 report["validated_assets"].append({
                     "hostname": name,
+                    "confidence": "high",
                     "dns": {"ips": node["ips"], "cname": node["cname"]},
                     "parent": node["parent"],
                     "origin": node["origin"],
-                    "evidence": [{"source": s, "detail": d}
+                    "evidence": [{"source": s, "detail": d, "observed_at": report_time}
                                  for s, d in node["evidence"]],
                 })
             for name in sorted(self.leads):
                 lead = self.leads[name]
                 report["unverified_leads"].append({
                     "hostname": name,
+                    "confidence": "low",
                     "parent": lead["parent"],
                     "origin": lead["origin"],
-                    "evidence": [{"source": s, "detail": d}
+                    "evidence": [{"source": s, "detail": d, "observed_at": report_time}
                                  for s, d in lead["evidence"]],
                     "reason": lead["reason"],
                 })
+            report["external_related_domains"] = [self.external_domains[k]
+                                                   for k in sorted(self.external_domains)]
         groups = defaultdict(list)
         with self.lock:
             for name, node in self.nodes.items():
@@ -1693,6 +1747,26 @@ def write_txt(report, path):
     for l in report["unverified_leads"]:
         out.append(f"? {l['hostname']}  parent={l['parent'] or '-'} "
                    f"origin={','.join(l['origin'])} reason={l['reason'] or '-'}")
+    if report.get("external_related_domains"):
+        out.append("")
+        out.append("EXTERNAL RELATED DOMAINS (not validated or crawled)")
+        out.append("-" * 40)
+        for item in report["external_related_domains"]:
+            out.append(f"{item['hostname']}  linked from={item['related_to']}")
+    if report.get("scan_changes"):
+        out.append("")
+        out.append("CHANGES SINCE PREVIOUS SCAN")
+        out.append("-" * 40)
+        for key in ("new", "removed", "changed"):
+            out.append(f"{key}: {', '.join(report['scan_changes'].get(key, [])) or '-'}")
+    failed = {k: v for k, v in report.get("source_status", {}).items()
+              if v.get("status") in ("failed", "skipped")}
+    if failed:
+        out.append("")
+        out.append("UNAVAILABLE / SKIPPED SOURCES")
+        out.append("-" * 40)
+        for source, result in sorted(failed.items()):
+            out.append(f"{source}: {result.get('status')} - {result.get('error', '')}")
     out.append("")
     out.append("SHARED INFRASTRUCTURE (identical DNS answers)")
     out.append("-" * 40)
@@ -1873,7 +1947,9 @@ def main(argv=None):
         write_xlsx(report, xlsx_path)
 
     try:
-        persist_sqlite(args.db, report)
+        report["scan_changes"] = persist_sqlite(args.db, report)
+        write_json(report, json_path)
+        write_txt(report, txt_path)
     except Exception as e:
         print(f"[warn] sqlite persist failed: {e}")
 
@@ -1922,24 +1998,46 @@ def persist_sqlite(db_path, report):
     conn = sqlite3.connect(db_path)
     try:
         cur = conn.cursor()
-        cur.execute("DROP TABLE IF EXISTS nodes")
-        cur.execute("DROP TABLE IF EXISTS evidence")
-        cur.execute(
-            """CREATE TABLE nodes (
-                hostname TEXT PRIMARY KEY,
-                parent TEXT,
-                validated INTEGER,
-                origin TEXT,
-                ips TEXT,
-                cname TEXT
-            )""")
-        cur.execute(
-            """CREATE TABLE evidence (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                hostname TEXT,
-                source TEXT,
-                detail TEXT
-            )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS scans (
+            scan_id INTEGER PRIMARY KEY AUTOINCREMENT, root TEXT, timestamp TEXT)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS scan_assets (
+            scan_id INTEGER, hostname TEXT, status TEXT, fingerprint TEXT,
+            PRIMARY KEY(scan_id, hostname))""")
+        cur.execute("SELECT scan_id FROM scans WHERE root=? ORDER BY scan_id DESC LIMIT 1",
+                    (report["root"],))
+        previous_id = cur.fetchone()
+        previous = {}
+        if previous_id:
+            cur.execute("SELECT hostname,status,fingerprint FROM scan_assets WHERE scan_id=?",
+                        (previous_id[0],))
+            previous = {n: (s, f) for n, s, f in cur.fetchall()}
+        current = {}
+        for a in report["validated_assets"]:
+            evidence = [{k: v for k, v in e.items() if k != "observed_at"}
+                        for e in a["evidence"]]
+            current[a["hostname"]] = ("confirmed", json.dumps(
+                {"parent": a["parent"], "dns": a["dns"], "evidence": evidence}, sort_keys=True))
+        for a in report["unverified_leads"]:
+            evidence = [{k: v for k, v in e.items() if k != "observed_at"}
+                        for e in a["evidence"]]
+            current[a["hostname"]] = ("unverified", json.dumps(
+                {"parent": a["parent"], "evidence": evidence, "reason": a["reason"]}, sort_keys=True))
+        changes = {
+            "new": sorted(n for n in current if n not in previous),
+            "removed": sorted(n for n in previous if n not in current),
+            "changed": sorted(n for n in current.keys() & previous.keys()
+                               if current[n] != previous[n]),
+        }
+        cur.execute("INSERT INTO scans(root,timestamp) VALUES (?,?)",
+                    (report["root"], report["timestamp"]))
+        scan_id = cur.lastrowid
+        cur.executemany("INSERT INTO scan_assets VALUES (?,?,?,?)",
+                        [(scan_id, n, s, f) for n, (s, f) in current.items()])
+        # Preserve legacy latest-run tables for existing consumers.
+        cur.execute("CREATE TABLE IF NOT EXISTS nodes (hostname TEXT PRIMARY KEY,parent TEXT,validated INTEGER,origin TEXT,ips TEXT,cname TEXT)")
+        cur.execute("CREATE TABLE IF NOT EXISTS evidence (id INTEGER PRIMARY KEY AUTOINCREMENT,hostname TEXT,source TEXT,detail TEXT)")
+        cur.execute("DELETE FROM nodes")
+        cur.execute("DELETE FROM evidence")
         for a in report["validated_assets"]:
             cur.execute("INSERT INTO nodes VALUES (?,?,?,?,?,?)",
                         (a["hostname"], a["parent"], 1,
@@ -1956,6 +2054,8 @@ def persist_sqlite(db_path, report):
                 cur.execute("INSERT INTO evidence (hostname, source, detail) VALUES (?,?,?)",
                             (l["hostname"], e["source"], e["detail"]))
         conn.commit()
+        changes["scan_id"] = scan_id
+        return changes
     finally:
         conn.close()
 
