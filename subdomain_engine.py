@@ -35,7 +35,7 @@ import sys
 import threading
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
@@ -79,6 +79,7 @@ DEFAULT_DEPTH = 2
 DEFAULT_WORKERS = 50
 MAX_CANDIDATES_DEFAULT = 600
 DEFAULT_TABLE_ROWS = 60
+DEFAULT_NEW_DAYS = 0
 
 CT_SOURCES = ("ct", "certspotter")
 
@@ -252,15 +253,6 @@ REAL_LEARNING_SOURCES = {
     "hackertarget", "cdx", "urlscan", "tls",
 }
 
-# Vocab used to split registrable labels into words.
-BRAND_VOCAB = {
-    "soft", "tech", "data", "net", "web", "sys", "info",
-    "global", "prime", "core", "hub", "stack", "flow", "link", "sync",
-    "node", "vault", "zenith", "apex", "nova", "orbit", "pulse", "wave",
-    "spark", "flux", "mesh", "grid", "retain", "eye", "hawk", "tor", "fly",
-    "signal", "routes", "genie", "ster", "clinics", "health", "scanner",
-    "screener", "him", "fwa", "tact", "bio", "edu", "retaileye",
-}
 
 
 # --------------------------------------------------------------------------- small helpers
@@ -378,8 +370,13 @@ def http_get(url, timeout=HTTP_TIMEOUT, max_bytes=MAX_BODY, insecure=False):
 # --------------------------------------------------------------------------- passive discovery sources
 def fetch_crt_sh(domain, insecure=False):
     """crt.sh certificate transparency. Two URL forms, max 2 attempts each,
-    502/503/504 treated as service down (fail fast, never blocks others)."""
+    502/503/504 treated as service down (fail fast, never blocks others).
+
+    Returns (names: list[str], first_seen: dict[str, datetime|None], error_or_None).
+    first_seen maps hostname -> earliest certificate timestamp if available.
+    """
     names = []
+    first_seen = {}
     forms = [
         "https://crt.sh/?q=%25.{0}&output=json".format(domain),
         "https://crt.sh/?q={0}&output=json".format(domain),
@@ -388,10 +385,8 @@ def fetch_crt_sh(domain, insecure=False):
         for _attempt in range(2):
             status, body, err = http_get(url, timeout=CT_TIMEOUT, insecure=insecure)
             if err is not None and status is None:
-                # connection-level failure: try the next form
                 break
             if status in (502, 503, 504):
-                # service down: fail fast, try next form
                 break
             if status == 200 and body:
                 try:
@@ -402,20 +397,94 @@ def fetch_crt_sh(domain, insecure=False):
                     nv = row.get("name_value") if isinstance(row, dict) else None
                     if not nv and isinstance(row, str):
                         nv = row
+                    ts = None
+                    if isinstance(row, dict):
+                        ts_raw = row.get("entry_timestamp") or row.get("not_before")
+                        if ts_raw:
+                            try:
+                                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                            except Exception:
+                                try:
+                                    ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
+                                    ts = ts.replace(tzinfo=timezone.utc)
+                                except Exception:
+                                    ts = None
                     if nv:
                         for part in str(nv).split("\n"):
                             nn = normalize_name(part)
                             if nn and is_in_scope(nn, domain):
                                 names.append(nn)
-                return names, None
-            # any other status: try next form
+                                if nn not in first_seen or (ts and first_seen[nn] and ts < first_seen[nn]):
+                                    first_seen[nn] = ts
+                                elif nn not in first_seen:
+                                    first_seen[nn] = ts
+                return names, first_seen, None
             break
-    return names, "crt.sh: service down or no usable response"
+    return names, first_seen, "crt.sh: service down or no usable response"
+
+
+def fetch_crt_name(domain, insecure=False):
+    """crt.name certificate transparency fallback (used when crt.sh is down).
+
+    Returns (names: list[str], first_seen: dict[str, datetime|None], error_or_None).
+    """
+    names = []
+    first_seen = {}
+    forms = [
+        "https://crt.name/?q=%25.{0}&output=json".format(domain),
+        "https://crt.name/?q={0}&output=json".format(domain),
+        "https://crt.name/api/v1/search?q={0}".format(domain),
+    ]
+    for url in forms:
+        for _attempt in range(2):
+            status, body, err = http_get(url, timeout=CT_TIMEOUT, insecure=insecure)
+            if err is not None and status is None:
+                break
+            if status in (502, 503, 504):
+                break
+            if status == 200 and body:
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    data = []
+                rows = data if isinstance(data, list) else data.get("data", [])
+                for row in rows:
+                    nv = row.get("name_value") or row.get("common_name") or row.get("domain") if isinstance(row, dict) else None
+                    if not nv and isinstance(row, str):
+                        nv = row
+                    ts = None
+                    if isinstance(row, dict):
+                        ts_raw = row.get("entry_timestamp") or row.get("not_before") or row.get("created_at")
+                        if ts_raw:
+                            try:
+                                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                            except Exception:
+                                try:
+                                    ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
+                                    ts = ts.replace(tzinfo=timezone.utc)
+                                except Exception:
+                                    ts = None
+                    if nv:
+                        for part in str(nv).split("\n"):
+                            nn = normalize_name(part)
+                            if nn and is_in_scope(nn, domain):
+                                names.append(nn)
+                                if nn not in first_seen or (ts and first_seen[nn] and ts < first_seen[nn]):
+                                    first_seen[nn] = ts
+                                elif nn not in first_seen:
+                                    first_seen[nn] = ts
+                return names, first_seen, None
+            break
+    return names, first_seen, "crt.name: service down or no usable response"
 
 
 def fetch_certspotter(domain, insecure=False):
-    """Certspotter (paginated, first page primarily)."""
+    """Certspotter (paginated, first page primarily).
+
+    Returns (names: list[str], first_seen: dict[str, datetime|None], error_or_None).
+    """
     names = []
+    first_seen = {}
     url = ("https://api.certspotter.com/v1/issuances?"
            "domain={0}&include_subdomains=true&expand=dns_names").format(domain)
     try:
@@ -430,14 +499,25 @@ def fetch_certspotter(domain, insecure=False):
             if not isinstance(data, list):
                 break
             for issuance in data:
+                ts = None
+                ts_raw = issuance.get("not_before")
+                if ts_raw:
+                    try:
+                        ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                    except Exception:
+                        ts = None
                 for dn in issuance.get("dns_names", []) or []:
                     nn = normalize_name(dn)
                     if nn and is_in_scope(nn, domain):
                         names.append(nn)
+                        if nn not in first_seen or (ts and first_seen[nn] and ts < first_seen[nn]):
+                            first_seen[nn] = ts
+                        elif nn not in first_seen:
+                            first_seen[nn] = ts
             break
     except Exception as e:
-        return names, "certspotter: {0}".format(e)
-    return names, None
+        return names, first_seen, "certspotter: {0}".format(e)
+    return names, first_seen, None
 
 
 def fetch_otx(domain, insecure=False):
@@ -571,6 +651,7 @@ def fetch_urlscan(domain, insecure=False):
 
 PASSIVE_SOURCES = [
     ("ct", fetch_crt_sh),
+    ("crt.name", fetch_crt_name),
     ("certspotter", fetch_certspotter),
     ("otx", fetch_otx),
     ("anubis", fetch_anubis),
@@ -584,9 +665,10 @@ PASSIVE_SOURCES = [
 def run_passive_sources(domain, insecure=False, no_ct=False, max_workers=DEFAULT_WORKERS,
                         statuses=None):
     """Query every passive source in parallel. Returns dict name -> set of
-    source tags that reported it. Logs each source clearly; one dead source
-    never stops the run."""
+    source tags that reported it, plus a first_seen dict name -> datetime.
+    Logs each source clearly; one dead source never stops the run."""
     results = defaultdict(set)
+    first_seen = {}
     lock = threading.Lock()
 
     def run_source(tag, func):
@@ -596,9 +678,16 @@ def run_passive_sources(domain, insecure=False, no_ct=False, max_workers=DEFAULT
                 statuses[tag] = {"status": "skipped", "error": "--no-ct"}
             return
         try:
-            names, err = func(domain, insecure=insecure)
+            result = func(domain, insecure=insecure)
+            # CT sources now return (names, first_seen, err); others return (names, err)
+            if len(result) == 3:
+                names, name_ts, err = result
+            else:
+                names, err = result
+                name_ts = {}
         except Exception as e:  # never let one source kill the run
             names, err = [], "{0}".format(e)
+            name_ts = {}
         with lock:
             if err:
                 print(f"[passive] {tag}: FAILED - {err}")
@@ -610,6 +699,10 @@ def run_passive_sources(domain, insecure=False, no_ct=False, max_workers=DEFAULT
                     statuses[tag] = {"status": "ok", "count": len(names)}
                 for nn in names:
                     results[nn].add(tag)
+                    if nn in name_ts and name_ts[nn]:
+                        prev = first_seen.get(nn)
+                        if prev is None or name_ts[nn] < prev:
+                            first_seen[nn] = name_ts[nn]
 
     with ThreadPoolExecutor(max_workers=min(max_workers, len(PASSIVE_SOURCES))) as ex:
         futures = [ex.submit(run_source, tag, func) for tag, func in PASSIVE_SOURCES]
@@ -620,7 +713,7 @@ def run_passive_sources(domain, insecure=False, no_ct=False, max_workers=DEFAULT
                 raise
             except Exception:
                 pass
-    return dict(results)
+    return dict(results), first_seen
 
 
 # --------------------------------------------------------------------------- TLS SAN harvesting
@@ -1127,11 +1220,14 @@ class Engine:
         # Per-origin candidate stats: {origin: {generated, tested, resolved, unresolved}}
         self.origin_stats = defaultdict(lambda: {"generated": 0, "tested": 0,
                                                   "resolved": 0, "unresolved": 0})
+        # first_seen timestamps from CT/passive sources
+        self.first_seen = {}
 
         self.insecure = bool(getattr(args, "insecure_api", False))
 
     # -- observation --------------------------------------------------------
-    def observe(self, name, parent=None, source=None, detail=None, explicit=False):
+    def observe(self, name, parent=None, source=None, detail=None, explicit=False,
+                first_seen=None):
         nn = normalize_name(name)
         if not nn:
             return
@@ -1152,6 +1248,10 @@ class Engine:
                 rec["explicit"] = True
             if detail:
                 rec["details"].append((source, detail))
+            if first_seen:
+                prev = self.first_seen.get(nn)
+                if prev is None or first_seen < prev:
+                    self.first_seen[nn] = first_seen
 
     def _wildcard_ips(self, parent_domain):
         if parent_domain not in self.wildcard_cache:
@@ -1324,18 +1424,34 @@ class Engine:
                 print(f"[warn] could not read import file {args.import_names}: {e}")
 
         # ---- depth 0: passive sources (%.root) ----
+        new_cutoff = None
+        if bool(getattr(args, "new_only", False)) or getattr(args, "new_days", 0) > 0:
+            new_days = int(getattr(args, "new_days", DEFAULT_NEW_DAYS))
+            new_cutoff = datetime.now(timezone.utc) - timedelta(days=new_days)
+            self.new_cutoff = new_cutoff
+            print(f"[new-subdomains] filtering to certs issued within last {new_days} day(s) "
+                  f"(on/after {new_cutoff.date()})")
+        else:
+            self.new_cutoff = None
+
         if not args.no_ct:
             source_status = self.stats.setdefault("source_status", {})
-            passive = run_passive_sources(domain, insecure=self.insecure,
-                                          no_ct=args.no_ct, max_workers=args.workers,
-                                          statuses=source_status)
+            passive_result = run_passive_sources(domain, insecure=self.insecure,
+                                                 no_ct=args.no_ct, max_workers=args.workers,
+                                                 statuses=source_status)
+            # New run_passive_sources returns (results, first_seen)
+            if isinstance(passive_result, tuple) and len(passive_result) == 2:
+                passive, passive_first_seen = passive_result
+            else:
+                passive, passive_first_seen = passive_result, {}
             for name, srcs in passive.items():
                 explicit = bool(srcs & EXPLICIT_SOURCES)
                 parent = self._nearest_validated_ancestor(name)
+                fs = passive_first_seen.get(name)
                 for s in srcs:
                     self.observe(name, parent=parent, source=s,
                                  detail="{0} passive source".format(s),
-                                 explicit=explicit)
+                                 explicit=explicit, first_seen=fs)
         else:
             print("[passive] certificate-transparency sources skipped (--no-ct)")
             self.stats["source_status"] = {
@@ -1505,6 +1621,36 @@ class Engine:
                   f"{s['generated']:6d} / {s['tested']:6d} / "
                   f"{s['resolved']:6d} / {s['unresolved']:6d}")
 
+        # ---- new-subdomain filtering (--new-only / --new-days) ----
+        if new_cutoff is not None:
+            new_names = []
+            with self.lock:
+                for name in list(self.nodes.keys()):
+                    if name == self.domain:
+                        continue
+                    ts = self.first_seen.get(name)
+                    if ts and ts >= new_cutoff:
+                        new_names.append(name)
+                for name in list(self.leads.keys()):
+                    ts = self.first_seen.get(name)
+                    if ts and ts >= new_cutoff:
+                        new_names.append(name)
+            new_names = sorted(set(new_names))
+            self.stats["new_subdomains"] = new_names
+            self.stats["new_subdomains_count"] = len(new_names)
+            print(f"[new-subdomains] {len(new_names)} new subdomain(s) found in last "
+                  f"{int((datetime.now(timezone.utc) - new_cutoff).days)} day(s):")
+            for n in new_names:
+                print(f"  + {n}")
+            if bool(getattr(args, "new_only", False)):
+                # Keep only new subdomains in nodes/leads
+                with self.lock:
+                    self.nodes = {n: self.nodes[n] for n in new_names if n in self.nodes}
+                    self.leads = {n: self.leads[n] for n in new_names if n in self.leads}
+                    # Also keep the root domain if validated
+                    if self.domain in self.nodes:
+                        self.nodes[self.domain] = self.nodes[self.domain]
+
         return self._build_report()
 
     # -- helpers ------------------------------------------------------------
@@ -1567,6 +1713,9 @@ class Engine:
             "sources": self.stats["sources"],
             "source_status": self.stats.get("source_status", {}),
             "origin_stats": {k: dict(v) for k, v in self.origin_stats.items()},
+            "new_subdomains": self.stats.get("new_subdomains", []),
+            "new_subdomains_count": self.stats.get("new_subdomains_count", 0),
+            "new_cutoff": self.new_cutoff.isoformat() if self.new_cutoff else None,
         }
         with self.lock:
             for name in sorted(self.nodes):
@@ -1759,6 +1908,12 @@ def write_txt(report, path):
         out.append("-" * 40)
         for key in ("new", "removed", "changed"):
             out.append(f"{key}: {', '.join(report['scan_changes'].get(key, [])) or '-'}")
+    if report.get("new_subdomains"):
+        out.append("")
+        out.append(f"NEW SUBDOMAINS (certs issued within last {report.get('new_subdomains_count', len(report['new_subdomains']))} day(s))")
+        out.append("-" * 40)
+        for n in report["new_subdomains"]:
+            out.append(f"+ {n}")
     failed = {k: v for k, v in report.get("source_status", {}).items()
               if v.get("status") in ("failed", "skipped")}
     if failed:
@@ -1899,6 +2054,11 @@ def build_parser():
     p.add_argument("--xlsx", action="store_true", help="Also write discovery.xlsx")
     p.add_argument("--table-rows", type=int, default=DEFAULT_TABLE_ROWS,
                    help="Max rows in console table")
+    p.add_argument("--new-days", type=int, default=DEFAULT_NEW_DAYS,
+                   help="Show subdomains with certs issued within last N days (default %(default)s). "
+                        "Set to 0 to disable new-subdomain filtering.")
+    p.add_argument("--new-only", action="store_true",
+                   help="Only show subdomains newly discovered within --new-days (implies filtering).")
     p.add_argument("--insecure-api", action="store_true",
                    help="Opt-in: disable TLS certificate verification")
     p.add_argument("-q", "--quiet", action="store_true", help="Reduce console log noise")
@@ -1987,6 +2147,15 @@ def main(argv=None):
         print("-" * 40)
         for l in report["unverified_leads"]:
             print(f"? {l['hostname']}  [{','.join(l['origin'])}]")
+
+    # ---- print new subdomains section ----
+    new_subs = report.get("new_subdomains", [])
+    if new_subs:
+        print(f"\nNEW SUBDOMAINS (certs issued within last {report.get('new_subdomains_count', len(new_subs))} day(s))")
+        print("-" * 40)
+        for n in new_subs:
+            ts = report.get("new_cutoff")
+            print(f"+ {n}")
 
     tee.close()
     sys.stdout = tee.terminal

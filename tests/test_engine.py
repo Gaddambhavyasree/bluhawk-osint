@@ -355,5 +355,73 @@ def test_ascii_rendering():
     assert got.startswith("example.com\n|")
 
 
+def test_deep_links_hidden_refs_sitemap_and_external_domains(monkeypatch):
+    pages = {
+        "https://example.com/": ('<a href="/products/">Products</a>'
+                                 '<a href="https://api.example.com/reference">API</a>'
+                                 '<a href="https://productco.test/">Our acquisition</a>'),
+        "https://example.com/robots.txt": "User-agent: *\nDisallow: /private\nSitemap: https://example.com/maps/index.xml",
+        "https://example.com/sitemap.xml": "",
+        "https://example.com/maps/index.xml": '<sitemapindex><sitemap><loc>https://example.com/maps/products.xml</loc></sitemap></sitemapindex>',
+        "https://example.com/maps/products.xml": '<urlset><url><loc>https://example.com/press/acquired-cloud/</loc></url></urlset>',
+        "https://example.com/products/": '<a href="/products/cloud-suite">Cloud Suite</a>',
+        "https://example.com/products/cloud-suite": '<h1>Cloud Suite</h1><a href="/private/secret">Secret Suite</a>',
+        "https://example.com/press/acquired-cloud/": "<p>Hidden product reference: Cloud Suite acquired.</p>",
+    }
+    requests = []
+    def get(url, **kwargs):
+        requests.append(url)
+        return (200, pages[url], None) if url in pages else (404, "", "not found")
+    monkeypatch.setattr(SE, "http_get", get)
+    hosts, entities, _keywords, external = SE.analyze_website("example.com", "example.com")
+    assert "api.example.com" in hosts
+    assert "productco.test" in external
+    assert "cloudsuite" in {name for name, _ in entities}
+    assert "https://example.com/private/secret" not in requests
+
+
+def test_scan_history_reports_new_removed_and_changed(tmp_path):
+    def report(timestamp, assets):
+        return {"root": "example.com", "timestamp": timestamp,
+                "validated_assets": assets, "unverified_leads": []}
+    def asset(name, ip, parent="example.com"):
+        return {"hostname": name, "parent": parent, "dns": {"ips": [ip], "cname": None},
+                "origin": ["ct"], "evidence": [{"source": "ct", "detail": ip}]}
+    db = str(tmp_path / "history.db")
+    first = SE.persist_sqlite(db, report("2026-01-01T00:00:00Z", [asset("a.example.com", "1.1.1.1"), asset("b.example.com", "2.2.2.2")]))
+    assert first["new"] == ["a.example.com", "b.example.com"]
+    second = SE.persist_sqlite(db, report("2026-01-02T00:00:00Z", [asset("a.example.com", "1.1.1.2"), asset("c.example.com", "3.3.3.3")]))
+    assert second["new"] == ["c.example.com"]
+    assert second["removed"] == ["b.example.com"]
+    assert second["changed"] == ["a.example.com"]
+    third = SE.persist_sqlite(db, report("2026-01-03T00:00:00Z", [asset("a.example.com", "1.1.1.2"), asset("c.example.com", "3.3.3.3")]))
+    assert third["changed"] == []
+    assert third["new"] == [] and third["removed"] == []
+
+
+def test_evidence_deduplication_preserves_distinct_sources():
+    eng = SE.Engine("example.com", SE.build_parser().parse_args(["example.com", "--no-ct"]))
+    eng._make_node("www.example.com", "example.com", ["ct"], [("ct", "certificate")], ["1.1.1.1"], None)
+    eng._make_node("www.example.com", "example.com", ["ct", "website"],
+                   [("ct", "certificate"), ("website", "linked hostname")], ["1.1.1.1"], None)
+    node = eng.nodes["www.example.com"]
+    assert node["origin"] == ["ct", "website"]
+    assert node["evidence"] == [("ct", "certificate"), ("website", "linked hostname")]
+
+
+def test_source_failure_is_reported():
+    statuses = {}
+    def fail(_domain, **_kwargs):
+        return [], "provider unavailable"
+    old = SE.PASSIVE_SOURCES
+    SE.PASSIVE_SOURCES = [("fixture", fail)]
+    try:
+        result = SE.run_passive_sources("example.com", statuses=statuses)
+        assert result[0] == {}
+    finally:
+        SE.PASSIVE_SOURCES = old
+    assert statuses["fixture"] == {"status": "failed", "error": "provider unavailable"}
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
