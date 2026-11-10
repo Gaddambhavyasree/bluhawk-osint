@@ -253,6 +253,17 @@ REAL_LEARNING_SOURCES = {
     "hackertarget", "cdx", "urlscan", "tls",
 }
 
+# Vocab used to split registrable labels into words.
+# Only generic English/tech terms — no company-specific product or brand names.
+BRAND_VOCAB = {
+    "soft", "tech", "data", "net", "web", "sys", "info",
+    "global", "prime", "core", "hub", "stack", "flow", "link", "sync",
+    "node", "vault", "apex", "nova", "orbit", "pulse", "wave",
+    "spark", "flux", "mesh", "grid", "signal", "routes",
+    "soft", "ware", "lab", "labs", "group", "systems", "solutions",
+    "services", "digital", "smart", "next", "first", "best", "top",
+    "alpha", "beta", "gamma", "delta", "omega",
+}
 
 
 # --------------------------------------------------------------------------- small helpers
@@ -325,7 +336,7 @@ def split_into_words(label):
 
 
 # --------------------------------------------------------------------------- network chokepoint (single mockable entry point)
-def http_get(url, timeout=HTTP_TIMEOUT, max_bytes=MAX_BODY, insecure=False):
+def http_get(url, timeout=HTTP_TIMEOUT, max_bytes=MAX_BODY, insecure=False, headers=None):
     """Single HTTP GET chokepoint.
 
     Returns (status_code_or_None, body_text_or_None, error_or_None).
@@ -333,7 +344,9 @@ def http_get(url, timeout=HTTP_TIMEOUT, max_bytes=MAX_BODY, insecure=False):
     http_get in one place, and so timeouts / size limits / error capture are
     consistent.
     """
-    headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+    default_headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+    if headers:
+        default_headers.update(headers)
     ctx = ssl.create_default_context()
     if insecure:
         ctx.check_hostname = False
@@ -343,7 +356,7 @@ def http_get(url, timeout=HTTP_TIMEOUT, max_bytes=MAX_BODY, insecure=False):
             ctx.load_verify_locations(certifi.where())
         except Exception:
             pass
-    req = Request(url, headers=headers)
+    req = Request(url, headers=default_headers)
     try:
         with urlopen(req, timeout=timeout, context=ctx) as resp:
             status = getattr(resp, "status", None)
@@ -392,6 +405,8 @@ def fetch_crt_sh(domain, insecure=False):
                 try:
                     data = json.loads(body)
                 except Exception:
+                    data = []
+                if data is None:
                     data = []
                 for row in data:
                     nv = row.get("name_value") if isinstance(row, dict) else None
@@ -447,6 +462,8 @@ def fetch_crt_name(domain, insecure=False):
                     data = json.loads(body)
                 except Exception:
                     data = []
+                if data is None:
+                    data = []
                 rows = data if isinstance(data, list) else data.get("data", [])
                 for row in rows:
                     nv = row.get("name_value") or row.get("common_name") or row.get("domain") if isinstance(row, dict) else None
@@ -487,14 +504,21 @@ def fetch_certspotter(domain, insecure=False):
     first_seen = {}
     url = ("https://api.certspotter.com/v1/issuances?"
            "domain={0}&include_subdomains=true&expand=dns_names").format(domain)
+    certspotter_headers = {}
+    certspotter_api_key = os.environ.get("CERTSPOTTER_API_KEY", "")
+    if certspotter_api_key:
+        certspotter_headers["Authorization"] = "Bearer {0}".format(certspotter_api_key)
     try:
         for _page in range(3):
-            status, body, err = http_get(url, timeout=CT_TIMEOUT, insecure=insecure)
+            status, body, err = http_get(url, timeout=CT_TIMEOUT, insecure=insecure,
+                                         headers=certspotter_headers)
             if err is not None or status != 200:
                 break
             try:
                 data = json.loads(body)
             except Exception:
+                break
+            if data is None:
                 break
             if not isinstance(data, list):
                 break
@@ -521,16 +545,27 @@ def fetch_certspotter(domain, insecure=False):
 
 
 def fetch_otx(domain, insecure=False):
-    """AlienVault OTX passive DNS."""
+    """AlienVault OTX passive DNS.
+
+    Requires OTX_API_KEY environment variable or --otx-api-key argument for
+    authenticated access. Without a key, OTX returns 403 and is skipped.
+    """
     names = []
     url = "https://otx.alienvault.com/api/v1/indicators/domain/{0}/passive_dns".format(domain)
-    status, body, err = http_get(url, timeout=HTTP_TIMEOUT, insecure=insecure)
+    otx_headers = {}
+    otx_api_key = os.environ.get("OTX_API_KEY", "")
+    if otx_api_key:
+        otx_headers["X-OTX-API-KEY"] = otx_api_key
+    status, body, err = http_get(url, timeout=HTTP_TIMEOUT, insecure=insecure,
+                                 headers=otx_headers)
     if err is not None or status != 200:
         return names, "otx: {0}".format(err or "http {0}".format(status))
     try:
         data = json.loads(body)
     except Exception:
         return names, "otx: invalid json"
+    if data is None:
+        data = {}
     for rec in data.get("passive_dns", []) or []:
         host = rec.get("hostname") or rec.get("address")
         nn = normalize_name(host)
@@ -542,7 +577,7 @@ def fetch_otx(domain, insecure=False):
 def fetch_anubis(domain, insecure=False):
     """AnubisDB subdomains."""
     names = []
-    url = "https://jldc.me/anubis/subdomains/{0}".format(domain)
+    url = "https://anubisdb.com/subdomains/{0}".format(domain)
     status, body, err = http_get(url, timeout=HTTP_TIMEOUT, insecure=insecure)
     if err is not None or status != 200:
         return names, "anubis: {0}".format(err or "http {0}".format(status))
@@ -550,6 +585,8 @@ def fetch_anubis(domain, insecure=False):
         data = json.loads(body)
     except Exception:
         return names, "anubis: invalid json"
+    if data is None:
+        data = []
     if isinstance(data, list):
         for item in data:
             nn = normalize_name(item if isinstance(item, str) else str(item))
@@ -566,7 +603,7 @@ def fetch_anubis(domain, insecure=False):
 def fetch_subdomain_center(domain, insecure=False):
     """subdomain.center API."""
     names = []
-    url = "https://api.subdomain.center/?q={0}".format(domain)
+    url = "https://api.subdomain.center/?domain={0}".format(domain)
     status, body, err = http_get(url, timeout=HTTP_TIMEOUT, insecure=insecure)
     if err is not None or status != 200:
         return names, "subdomain.center: {0}".format(err or "http {0}".format(status))
@@ -574,6 +611,8 @@ def fetch_subdomain_center(domain, insecure=False):
         data = json.loads(body)
     except Exception:
         return names, "subdomain.center: invalid json"
+    if data is None:
+        data = []
     if isinstance(data, list):
         for item in data:
             nn = normalize_name(item)
@@ -593,33 +632,42 @@ def fetch_subdomain_center(domain, insecure=False):
 def fetch_hackertarget(domain, insecure=False):
     """HackerTarget hostsearch (returns 'host,ip' lines)."""
     names = []
-    url = "https://api.hackertarget.com/hostsearch/?q={0}".format(domain)
-    status, body, err = http_get(url, timeout=HTTP_TIMEOUT, insecure=insecure)
-    if err is not None or status != 200:
-        return names, "hackertarget: {0}".format(err or "http {0}".format(status))
-    for line in body.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        host = line.split(",")[0].split()[0]
-        nn = normalize_name(host)
-        if nn and is_in_scope(nn, domain):
-            names.append(nn)
+    try:
+        url = "https://api.hackertarget.com/hostsearch/?q={0}".format(domain)
+        status, body, err = http_get(url, timeout=HTTP_TIMEOUT, insecure=insecure)
+        if err is not None or status != 200:
+            return names, "hackertarget: {0}".format(err or "http {0}".format(status))
+        if body is None:
+            return names, "hackertarget: empty response"
+        for line in body.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            host = line.split(",")[0].split()[0]
+            nn = normalize_name(host)
+            if nn and is_in_scope(nn, domain):
+                names.append(nn)
+    except Exception as e:
+        return names, "hackertarget: {0}".format(e)
     return names, None
 
 
 def fetch_cdx(domain, insecure=False):
     """Internet Archive CDX: hostnames embedded in archived URLs."""
     names = []
-    url = ("https://web.archive.org/cdx/search/cdx?"
-           "url=*.{0}/*&output=text&fl=original&collapse=urlkey&limit=5000").format(domain)
-    status, body, err = http_get(url, timeout=HTTP_TIMEOUT, max_bytes=MAX_BODY, insecure=insecure)
-    if err is not None or status != 200:
-        return names, "cdx: {0}".format(err or "http {0}".format(status))
-    for m in re.finditer(r"https?://([^/?#]+)", body, re.I):
-        nn = normalize_name(m.group(1))
-        if nn and is_in_scope(nn, domain):
-            names.append(nn)
+    try:
+        url = "https://web.archive.org/cdx/search/cdx?url=*.{0}/*".format(domain)
+        status, body, err = http_get(url, timeout=HTTP_TIMEOUT, max_bytes=MAX_BODY, insecure=insecure)
+        if err is not None or status != 200:
+            return names, "cdx: {0}".format(err or "http {0}".format(status))
+        if body is None:
+            return names, "cdx: empty response"
+        for m in re.finditer(r"https?://([^/?#]+)", body, re.I):
+            nn = normalize_name(m.group(1))
+            if nn and is_in_scope(nn, domain):
+                names.append(nn)
+    except Exception as e:
+        return names, "cdx: {0}".format(e)
     return names, None
 
 
@@ -627,13 +675,20 @@ def fetch_urlscan(domain, insecure=False):
     """urlscan.io search for domain."""
     names = []
     url = "https://urlscan.io/api/v1/search/?q=domain:{0}".format(domain)
-    status, body, err = http_get(url, timeout=HTTP_TIMEOUT, insecure=insecure)
+    urlscan_headers = {}
+    urlscan_api_key = os.environ.get("URLSCAN_API_KEY", "")
+    if urlscan_api_key:
+        urlscan_headers["API-Key"] = urlscan_api_key
+    status, body, err = http_get(url, timeout=HTTP_TIMEOUT, insecure=insecure,
+                                 headers=urlscan_headers)
     if err is not None or status != 200:
         return names, "urlscan: {0}".format(err or "http {0}".format(status))
     try:
         data = json.loads(body)
     except Exception:
         return names, "urlscan: invalid json"
+    if data is None:
+        data = {}
     for rec in data.get("results", []) or []:
         task = rec.get("task", {}) or {}
         host = task.get("domain") or task.get("url")
@@ -854,6 +909,8 @@ def _fetch_text(url, insecure):
     status, body, err = http_get(url, timeout=HTTP_TIMEOUT, insecure=insecure)
     if err is not None or status != 200:
         return None
+    if not body:
+        return None
     return body
 
 
@@ -922,8 +979,11 @@ def analyze_website(hostname, domain, insecure=False):
 
     def fetch_and_handle(url):
         body = _fetch_text(url, insecure)
-        if body is not None:
-            handle_html(body, url)
+        if body:
+            try:
+                handle_html(body, url)
+            except Exception:
+                pass
 
     # Homepage is consumed by the same queue as every other page so its links
     # are actually enqueued and deeply nested product/docs links are reachable.
@@ -969,10 +1029,13 @@ def analyze_website(hostname, domain, insecure=False):
             continue
         visited.add(url)
         body = _fetch_text(url, insecure)
-        if body is None:
+        if not body:
             continue
         crawled += 1
-        handle_html(body, url)
+        try:
+            handle_html(body, url)
+        except Exception:
+            pass
         parser = _LinkExtractor()
         try:
             parser.feed(body)
@@ -2059,13 +2122,40 @@ def build_parser():
                         "Set to 0 to disable new-subdomain filtering.")
     p.add_argument("--new-only", action="store_true",
                    help="Only show subdomains newly discovered within --new-days (implies filtering).")
+    p.add_argument("--otx-api-key", default="",
+                   help="AlienVault OTX API key (or set OTX_API_KEY env var)")
     p.add_argument("--insecure-api", action="store_true",
                    help="Opt-in: disable TLS certificate verification")
     p.add_argument("-q", "--quiet", action="store_true", help="Reduce console log noise")
     return p
 
 
+def _load_env():
+    """Load environment variables from .env file if present.
+
+    Simple parser — no external dependency required.
+    """
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip().strip('"').strip("'")
+                    if key and key not in os.environ:
+                        os.environ[key] = val
+    except Exception:
+        pass
+
+
 def main(argv=None):
+    _load_env()
     args = build_parser().parse_args(argv)
 
     try:
@@ -2075,6 +2165,10 @@ def main(argv=None):
 
     if args.insecure_api:
         print("!! WARNING --insecure-api: TLS certificate verification is DISABLED (opt-in only).")
+
+    if args.otx_api_key:
+        os.environ["OTX_API_KEY"] = args.otx_api_key
+        print("[otx] API key provided via --otx-api-key")
 
     # --- save raw console log (live mode since this is the real CLI) ---
     base_noext = os.path.splitext(args.out)[0]

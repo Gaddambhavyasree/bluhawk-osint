@@ -28,7 +28,7 @@ The tool queries **8 public passive sources in parallel**. Each source is logged
 | **crt.sh** | `https://crt.sh/?q=%25.{domain}&output=json` | Certificate Transparency log hostnames |
 | **crt.name** | `https://crt.name/?q=%25.{domain}&output=json` | CT fallback when crt.sh is down |
 | **Certspotter** | `https://api.certspotter.com/v1/issuances?domain={domain}` | CT issuance DNS names with timestamps |
-| **AlienVault OTX** | `https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns` | Passive DNS history |
+| **AlienVault OTX** | `https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns` | Passive DNS history (requires `OTX_API_KEY` env var or `--otx-api-key` argument) |
 | **AnubisDB** | `https://jldc.me/anubis/subdomains/{domain}` | Subdomain enumeration data |
 | **subdomain.center** | `https://api.subdomain.center/?q={domain}` | Subdomain API results |
 | **HackerTarget** | `https://api.hackertarget.com/hostsearch/?q={domain}` | Host + IP pairs from passive DNS |
@@ -117,6 +117,12 @@ python subdomain_engine.py example.com --new-days 1 --new-only --xlsx
 
 # Offline mode using seeds and imports only
 python subdomain_engine.py example.com --no-ct --no-web --no-tls --seed www,api,dev --import-names subs.txt --wordlist names.txt
+
+# With AlienVault OTX API key
+python subdomain_engine.py example.com --otx-api-key YOUR_OTX_KEY
+# Or set environment variable:
+#   $env:OTX_API_KEY="YOUR_OTX_KEY"   (PowerShell)
+#   export OTX_API_KEY="YOUR_OTX_KEY"  (Linux/macOS)
 ```
 
 ---
