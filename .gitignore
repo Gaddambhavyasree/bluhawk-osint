@@ -3,6 +3,8 @@
 .env.local
 .env.*.local
 
+#DB FILE
+run.db
 # Python
 __pycache__/
 *.py[cod]
