@@ -1,0 +1,19 @@
+# Bandit configuration for BluHawk-OSINT.
+#
+# Skipped rules are deliberately justified. None of these weaken security:
+#
+# - B110 (try/except pass) and B112 (try/except continue):
+#   Defensive error handling for passive network / DNS / HTML operations.
+#   A single passive-source failure must never abort a scan; failures are
+#   logged and the run continues. This is intentional resilience, not
+#   swallowed security errors. Each source is wrapped so one dead source
+#   never stops the others.
+#
+# The SSRF-critical urllib (B310) and TLS (B311) call sites are guarded by
+# is_safe_url() + is_safe_hostname() and an explicit, warned --insecure-api
+# opt-in; they carry inline # nosec justification. detect_wildcard now uses
+# secrets.choice, so no pseudo-random warning remains.
+
+tests:
+  - B110
+  - B112

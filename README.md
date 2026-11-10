@@ -1,8 +1,6 @@
-# Domain-Agnostic Recursive Subdomain Discovery and Intelligence Engine
+# Subdomain Discovery and Intelligence Engine
 
 A passive, domain-agnostic subdomain discovery and intelligence CLI written in Python. It builds a hierarchical tree of **validated subdomains** with parent-child relationships, evidence sources, and a separate list of **unverified leads** — for any domain you own or are authorised to assess.
-
-> **⚠️ Safety Warning:** Only run against domains you own or are authorised to assess. This tool uses passive sources only — no port scanning, no exploitation, no brute-force flooding.
 
 ---
 
@@ -21,7 +19,7 @@ A passive, domain-agnostic subdomain discovery and intelligence CLI written in P
 
 ## 2. Passive Discovery Sources
 
-The tool queries **9 public passive sources in parallel**. Each source is logged individually (`OK - N name(s)` or `FAILED - <error>`). One dead source never blocks the others.
+The tool queries **9 public passive sources in parallel**. 
 
 | # | Source | Endpoint Pattern | API Key? | What It Provides |
 |---|--------|-----------------|----------|------------------|
@@ -50,41 +48,32 @@ Performs a TLS handshake to port 443 of each confirmed host and reads certificat
 ### Stage 3 — Website Analysis
 Fetches `/`, `/robots.txt`, `/sitemap.xml`, crawls up to ~40 same-host pages, and inspects up to ~12 JS bundles. Extracts:
 - **Hostnames** from HTML/JS (including escaped slashes)
-- **Product/service entities** from nav anchors, buttons, headings (≤3 words), and URL path slugs. Each entity becomes both joined (`blurasaga`) and hyphenated (`blura-saga`) candidate forms.
+- **Product/service entities** from nav anchors, buttons, headings (≤3 words), and URL path slugs
 
 ### Stage 4 — DNS Record Mining
 Extracts hostnames from MX, NS, TXT, and SOA records (requires `dnspython`).
 
-### Stage 5 — Pattern Learning
-From verified hyphenated hostnames (e.g. `api-retaileye`), learns role/product conventions:
-- `api-retaileye` → role=`api`, product=`retaileye`
-- `assets-origin` → role=`assets`, product=`origin`
-- Generates `role-product` and `product-role` candidates across up to 2 learning rounds.
-
-Single-label hostnames (e.g. `adm`, `app`, `www`, `mb`) are **never** used as product tokens.
-
-### Stage 6 — Candidate Generation
+### Stage 5 — Candidate Generation
 Builds a candidate set tagged by origin:
 - Website entities
 - User `--seed` names
 - Common service labels at root (`www`, `api`, `dev`, `staging`, `admin`, …)
 - `--wordlist` (never truncated)
 - `--import-names` (from subfinder, amass, etc.)
-- Learned pattern candidates
 - Generic labels beneath each confirmed host (`api`, `dev`, `test`, `staging`, …)
 
-### Stage 7 — Validation
-Resolves A/AAAA/CNAME via DNS. Wildcard DNS is detected per parent using random labels; a name matching only the wildcard answer is **not** confirmed unless it has explicit CT/passive/TLS evidence.
+### Stage 6 — Validation
+Resolves A/AAAA/CNAME via DNS. Wildcard DNS is detected per parent using random labels; a name matching only the wildcard answer is **not** confirmed unless it has explicit CT/passive/TLS evidence. Hostnames are additionally checked to ensure they do not resolve to a private/reserved address (SSRF protection against DNS rebinding).
 
-### Stage 8 — Recursion
+### Stage 7 — Recursion
 Investigates every newly validated host (TLS, web, DNS records, child candidates) up to `--depth` (default 2). Passive `%.root` queries run once at depth 0 only.
 
-### Stage 9 — Dedup + Correlation
+### Stage 8 — Dedup + Correlation
 - Normalizes all names
 - One record per hostname with merged, de-duplicated evidence
 - Groups hosts sharing identical DNS answers as "shared infrastructure"
 
-### Stage 10 — Persistence
+### Stage 9 — Persistence
 - **JSON**: `discovery.json` — full structured results
 - **CSV**: `discovery.csv` (UTF-8 BOM for Excel)
 - **TXT**: `discovery_report.txt` — readable report
@@ -169,177 +158,15 @@ python subdomain_engine.py <domain> [options]
 | `--ascii` | Use ASCII tree rendering (`|--` / `` `-- ``) |
 | `--report-all-guesses` | List blind guesses that failed DNS as leads too |
 
-### New Subdomain Filtering
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--new-days` | `0` | Show subdomains with certs issued within last N days (0 = disabled) |
-| `--new-only` | — | Only show newly discovered subdomains within `--new-days` |
-
-### Other
-
-| Option | Description |
-|--------|-------------|
-| `--insecure-api` | Opt-in: disable TLS certificate verification (visible warning) |
-| `-q` / `--quiet` | Reduce console log noise |
-
----
-
-## 7. Examples
+## 7. Commands
 
 ```bash
-# 1. Basic scan against a domain you own
+# 1. Basic Scan
 python subdomain_engine.py example.com
-
-# 2. Deeper recursion with XLSX, annotation, unverified leads shown
-python subdomain_engine.py example.com --depth 3 --max-candidates 1200 \
-    --annotate --xlsx --show-unverified
-
-# 3. Only newly discovered subdomains from the last 24 hours
-python subdomain_engine.py example.com --new-days 1 --new-only --xlsx
-
-# 4. Feed in names from another tool (subfinder, amass, crt.sh export)
-python subdomain_engine.py example.com --seed www,api,dev \
-    --import-names subfinder_output.txt --wordlist names.txt
-
-# 5. Offline mode (no external APIs) using only seeds and DNS
-python subdomain_engine.py example.com --no-ct --no-web --no-tls \
-    --seed www,api,dev,vpn,mail
-
-# 6. With AlienVault OTX API key
-python subdomain_engine.py example.com --otx-api-key YOUR_OTX_KEY
-# Or set environment variable:
-#   $env:OTX_API_KEY="YOUR_OTX_KEY"   (PowerShell)
-#   export OTX_API_KEY="YOUR_OTX_KEY"  (Linux/macOS)
-```
-
----
-
-## 8. Output Files
-
-| File | Description |
-|------|-------------|
-| `discovery.json` | Full structured results (JSON) |
-| `discovery.csv` | CSV with UTF-8 BOM (Excel-compatible): `Status,Hostname,Origin,Parent,IPs,CNAME,Note` |
-| `discovery_report.txt` | Human-readable report (tree, validated list, unverified leads, shared infrastructure, learned patterns) |
-| `discovery.xlsx` | Excel workbook with **Validated**, **Unverified**, and **Hierarchy** sheets (bold header, filters, frozen header row) |
-| `run.db` | SQLite database (`scans`, `scan_assets`, `nodes`, `evidence` tables) |
-| `*_console.log` | Raw console log marked `MODE: LIVE` |
-
-### Console Output Example
+# 2. Excel Output
+python subdomain_engine.py example.com --xlsx
 
 ```
-Only run against domains you own or are authorised to assess.
-[engine] target: example.com
-[root] example.com: VALIDATED
-[passive] ct: OK - 248 name(s)
-[passive] certspotter: OK - 36 name(s)
-[passive] hackertarget: OK - 9 name(s)
-[passive] cdx: OK - 1632 name(s)
-[learning] roles=['api', 'assets', 'feed', 'gmr'] products=['origin', 'retaileye'] -> 44 candidate(s)
-[origin-stats] generated / tested / resolved / unresolved
-...
 
-12 validated | 156 unverified leads | 0 blind guesses did not resolve
 
-VALIDATED TREE
-----------------------------------------
-example.com
-│
-├── adm.example.com
-├── admin.example.com
-├── app.example.com
-├── mail.example.com
-└── www.example.com
-```
-
----
-
-## 9. Safety & Authorization
-
-This is a **passive reconnaissance tool only**:
-- Passive sources + ordinary DNS lookups + normal public HTTP GETs
-- **No port scanning, no exploitation, no brute-force flooding**
-- Default `User-Agent` identifies the tool (`BluCloud-Subdomain-Engine/1.0`)
-- Prints `Only run against domains you own or are authorised to assess.` on every run
-- `--insecure-api` is opt-in only with a visible warning
-
----
-
-## 10. Limitations (Honest)
-
-1. **Guessed names are leads, not assets.** A hostname becomes a validated asset only when it resolves in DNS (and is not merely a wildcard match without explicit evidence).
-2. **Names that exist in no public source and cannot be derived cannot be found.** Use `--seed`, `--wordlist`, and `--import-names` to supply additional candidate names.
-3. **External APIs may be blocked or rate-limited** in your environment (crt.sh frequently returns 502; OTX may return 429; Anubis may return 403). The tool handles failures gracefully and continues with remaining sources.
-4. **CDX (Internet Archive) returns archived URLs, not clean subdomains.** It is noisy; many entries are paths, files, or duplicates.
-5. **This tool will not discover internal-only or completely unreferenced subdomains.** Active DNS enumeration (zone transfer, brute-force resolution) is intentionally out of scope.
-
----
-
-## 11. API Key Setup
-
-Optional API keys for higher rate limits on OTX, urlscan.io, and Certspotter:
-
-Create a `.env` file (copy from `.env.example`):
-
-```ini
-OTX_API_KEY=your_otx_key_here
-URLSCAN_API_KEY=your_urlscan_key_here
-CERTSPOTTER_API_KEY=your_certspotter_key_here
-```
-
-Or pass via CLI:
-
-```bash
-python subdomain_engine.py example.com --otx-api-key YOUR_OTX_KEY
-```
-
-**Never commit `.env` to GitHub.** It is already in `.gitignore`.
-
----
-
-## 12. Testing
-
-The test suite runs **offline** by mocking `http_get`, `resolve_hostname`, and `tls_san_names`:
-
-```bash
-python -m pytest tests/ -v
-```
-
-Includes 14 tests covering:
-- CT names validated; unresolvable names unverified
-- crt.sh failure (502) with learning recovery
-- Wildcard DNS rejection
-- Unresolvable input root not validated
-- Tree renderer golden test (byte-for-byte)
-- Ctrl+C exports partial results
-- CSV BOM + columns; JSON validity
-- Entity derivation and label splitting
-- ASCII rendering
-- Scan history (new/removed/changed)
-- Evidence deduplication
-- Source failure reporting
-
----
-
-## 13. Repository Structure
-
-```
-subdomain_engine.py   # Single-file engine (well commented)
-tests/test_engine.py  # Offline pytest suite (14 tests)
-.env.example          # Template for API keys
-.gitignore            # Ignores .env, outputs, caches
-README.md             # This file
-```
-
----
-
-## 14. License
-
-Internal tooling. Use only against domains you own or are authorised to assess.
-
----
-
-## 15. Contributing
-
-Pull requests welcome. Please maintain the passive-only safety model and add tests for new features.

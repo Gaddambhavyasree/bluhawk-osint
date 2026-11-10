@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html as html_module
+import ipaddress
 import json
 import os
 import re
@@ -33,13 +34,14 @@ import sqlite3
 import string
 import sys
 import threading
+import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request, build_opener, HTTPRedirectHandler, HTTPSHandler
 
 # --------------------------------------------------------------------------- optional dependencies
 try:
@@ -81,144 +83,16 @@ MAX_CANDIDATES_DEFAULT = 600
 DEFAULT_TABLE_ROWS = 60
 DEFAULT_NEW_DAYS = 0
 
-CT_SOURCES = ("ct", "certspotter")
+CT_SOURCES = ("ct", "certspotter", "crt.name")
 
-GENERIC_WORDS = {
-    "home", "contact", "about", "services", "service", "products", "product",
-    "solutions", "solution", "platform", "feature", "features", "pricing",
-    "blog", "news", "careers", "jobs", "login", "signin", "signup", "register",
-    "logout", "sign-out", "signout", "help", "support", "docs", "documentation",
-    "api", "dev", "test", "staging", "admin", "administrator", "dashboard",
-    "portal", "account", "profile", "settings", "search", "insight", "insights",
-    "earnings", "earning", "investor", "investors", "press", "media", "privacy",
-    "terms", "legal", "cookie", "cookies", "sitemap", "xml", "www", "app", "web",
-    "website", "site", "secure", "security", "cybersecurity", "vpn", "mail",
-    "email", "ftp", "cdn", "asset", "assets", "static", "img", "image",
-    "images", "video",
-}
+# Rate limiting configuration
+REQUEST_INTERVAL_SECONDS = 0.5     # Minimum interval between requests to same host
+MAX_REQUESTS_PER_HOST = 60         # Max requests per host per 60 seconds
+RATE_LIMIT_MAX_WAIT = 5.0          # Maximum seconds to wait when rate limited
 
-# CSS properties, HTML/SVG attributes, JS DOM properties/events that appear as
-# link/button text or URL slugs on modern websites but are NOT product names.
-# These are filtered out of entity extraction to avoid noise like
-# mathbackground, maxwidth, meshgradient, mousedown, overflow, etc.
-ENTITY_NOISE = {
-    # CSS properties
-    "margin", "padding", "width", "height", "color", "background", "border",
-    "font", "text", "display", "position", "overflow", "margin", "visibility",
-    "opacity", "z-index", "transform", "transition", "animation", "flex",
-    "grid", "align", "justify", "content", "items", "self", "place", "order",
-    "gap", "row", "column", "flow", "wrap", "basis", "grow", "shrink",
-    "min-width", "min-height", "max-width", "max-height", "min", "max",
-    "border-radius", "border-color", "border-style", "border-width",
-    "box-shadow", "box-sizing", "cursor", "outline", "resize", "scroll",
-    "scroll-behavior", "tab-size", "user-select", "white-space", "word-break",
-    "word-wrap", "writing-mode", "hyphens", "line-height", "letter-spacing",
-    "text-align", "text-decoration", "text-indent", "text-justify",
-    "text-orientation", "text-overflow", "text-rendering", "text-shadow",
-    "text-transform", "vertical-align", "list-style", "marker", "outline",
-    "filter", "backdrop-filter", "mix-blend-mode", "isolation", "mask",
-    "mask-type", "clip", "clip-path", "shape-image-threshold",
-    "shape-margin", "shape-outside", "object-fit", "object-position",
-    "image-rendering", "pointer-events", "touch-action", "user-select",
-    # MathML attributes
-    "mathbackground", "mathcolor", "mathsize", "mathvariant", "mathalign",
-    "mathstyle", "mathsize", "decimalpoint", "denomalign", "mathaccent",
-    "mathaccentunder", "mathcolor", "mathdepth", "mathsize", "mathstyle",
-    "mathvariant", "movablelimits", "selection", "shift", "subscriptshift",
-    "supscriptshift", "underline", "overline", "strike", "radical",
-    # SVG attributes
-    "accent-height", "accumulate", "additive", "alignment-baseline",
-    "ascent", "attributeName", "attributeType", "azimuth", "baseFrequency",
-    "baseProfile", "baseline-shift", "bbox", "begin", "bias", "by", "calcMode",
-    "cap-height", "class", "clip-path", "clip-rule", "clipPathUnits",
-    "color-interpolation", "color-interpolation-filters", "color-profile",
-    "color-rendering", "contentScriptType", "contentStyleType", "cursor",
-    "cx", "cy", "d", "decelerate", "descent", "diffuseConstant", "direction",
-    "display", "divisor", "dur", "dx", "dy", "edgeMode", "elevation",
-    "enable-background", "end", "exponent", "externalResourcesRequired",
-    "fill", "fill-opacity", "fill-rule", "filter", "filterRes", "filterUnits",
-    "flood-color", "flood-opacity", "focusable", "font-family", "font-size",
-    "font-size-adjust", "font-stretch", "font-style", "font-variant",
-    "font-weight", "format", "from", "fr", "fx", "fy", "g1", "g2",
-    "glyph-name", "glyph-orientation-horizontal", "glyph-orientation-vertical",
-    "glyphRef", "gradientTransform", "gradientUnits", "hanging", "height",
-    "href", "horiz-adv-x", "horiz-origin-x", "id", "alphabetic", "arabic",
-    "ideographic", "mathematical", "image-rendering", "in", "in2",
-    "intercept", "k", "k1", "k2", "k3", "k4", "kernelMatrix", "kernelUnitLength",
-    "kerning", "keyPoints", "keySplines", "keyTimes", "lang", "lengthAdjust",
-    "letter-spacing", "kernel", "key", "keyTimes", "lighting-color", "limitingConeAngle",
-    "local", "marker-end", "marker-mid", "marker-start", "markerHeight",
-    "markerUnits", "markerWidth", "mask", "maskContentUnits", "maskUnits",
-    "mathematical", "max", "media", "method", "min", "mode", "name", "numOctaves",
-    "offset", "opacity", "operator", "order", "orient", "orientation", "origin",
-    "overflow", "overline-position", "overline-thickness", "panose-1",
-    "path", "pathLength", "patternContentUnits", "patternTransform",
-    "patternUnits", "ping", "pixels", "points", "pointsAtX", "pointsAtY",
-    "pointsAtZ", "preserveAlpha", "preserveAspectRatio", "primitiveUnits",
-    "r", "radius", "refX", "refY", "rendering-intent", "repeatCount",
-    "repeatDur", "requiredExtensions", "requiredFeatures", "restart",
-    "result", "rotate", "rx", "ry", "scale", "seed", "shape-rendering",
-    "slope", "spacing", "specularConstant", "specularExponent", "speed",
-    "spreadMethod", "startOffset", "stdDeviation", "stemh", "stemv",
-    "stitchTiles", "stop-color", "stop-opacity", "strikethrough-position",
-    "strikethrough-thickness", "string", "stroke", "stroke-dasharray",
-    "stroke-dashoffset", "stroke-linecap", "stroke-linejoin", "stroke-miterlimit",
-    "stroke-opacity", "stroke-width", "surfaceScale", "targetX", "targetY",
-    "text-anchor", "text-decoration", "text-rendering", "to", "transform",
-    "transform-origin", "u1", "u2", "underline-position", "underline-thickness",
-    "unicode", "unicode-bidi", "units-per-em", "v-alphabetic", "v-hanging",
-    "v-ideographic", "v-mathematical", "values", "version", "vert-adv-y",
-    "vert-origin-x", "vert-origin-y", "viewBox", "visibility", "width",
-    "word-spacing", "writing-mode", "x", "x-height", "x1", "x2", "xChannelSelector",
-    "xlink-actuate", "xlink:arcrole", "xlink:href", "xlink:role", "xlink:show",
-    "xlink:title", "xlink:type", "xml:base", "xml:lang", "xml:space", "y",
-    "y1", "y2", "yChannelSelector", "z", "zoomAndPan",
-    # JS / DOM / HTML common terms
-    "script", "style", "div", "span", "nav", "section", "article", "header",
-    "footer", "main", "aside", "figure", "figcaption", "details", "summary",
-    "dialog", "menu", "menuitem", "meter", "progress", "output", "datalist",
-    "keygen", "output", "picture", "source", "track", "video", "audio",
-    "canvas", "svg", "math", "iframe", "embed", "object", "param", "applet",
-    "audio", "video", "map", "area", "br", "wbr", "hr", "pre", "code", "samp",
-    "kbd", "var", "sub", "sup", "i", "b", "u", "em", "strong", "small",
-    "mark", "ruby", "rt", "rp", "bdi", "bdo", "span", "br", "blockquote",
-    "q", "cite", "dfn", "abbr", "address", "ins", "del", "time", "sup",
-    "onclick", "ondblclick", "onmousedown", "onmouseup", "onmouseover",
-    "onmousemove", "onmouseout", "onmouseenter", "onmouseleave", "onmousewheel",
-    "onkeydown", "onkeyup", "onkeypress", "onfocus", "onblur", "onfocusin",
-    "onfocusout", "onload", "onunload", "onabort", "onerror", "onscroll",
-    "onresize", "onsubmit", "onreset", "onchange", "onselect", "oninput",
-    "oninvalid", "onsearch", "onbeforeunload", "onhashchange", "onmessage",
-    "onoffline", "ononline", "onpagehide", "onpageshow", "onpopstate",
-    "onstorage", "ontoggle", "onwheel", "onshow", "oncontextmenu",
-    "onformdata", "onpointerdown", "onpointerup", "onpointermove",
-    "onpointerenter", "onpointerleave", "onpointerover", "onpointerout",
-    "onpointercancel", "ongotpointercapture", "onlostpointercapture",
-    "onanimationstart", "onanimationend", "onanimationiteration",
-    "ontransitionstart", "ontransitionend", "ontransitionrun",
-    "ontransitioncancel", "onbeforeinput", "oncopy", "oncut", "onpaste",
-    "onbeforecopy", "onbeforecut", "onbeforepaste", "ondragstart", "ondrag",
-    "ondragend", "ondragenter", "ondragleave", "ondragover", "ondrop",
-    "oncompositionstart", "oncompositionupdate", "oncompositionend",
-    "oncanplay", "oncanplaythrough", "ondurationchange", "onemptied",
-    "onended", "onerror", "onloadeddata", "onloadedmetadata", "onloadstart",
-    "onpause", "onplay", "onplaying", "onprogress", "onratechange",
-    "onseeked", "onseeking", "onstalled", "onsuspend", "ontimeupdate",
-    "onvolumechange", "onwaiting", "ontouchstart", "ontouchmove",
-    "ontouchend", "ontouchcancel", "webkit", "moz", "ms", "o",
-    # Common single words from UI that are not products
-    "home", "about", "contact", "services", "products", "product",
-    "solutions", "solution", "platform", "feature", "features", "pricing",
-    "blog", "news", "careers", "jobs", "login", "signin", "signup", "register",
-    "logout", "help", "support", "docs", "documentation", "search",
-    "privacy", "terms", "legal", "cookie", "cookies", "sitemap",
-    "secure", "security", "vpn", "mail", "email", "ftp", "cdn",
-    "asset", "assets", "static", "img", "image", "images", "video",
-    "press", "media", "insight", "insights", "earnings", "investor",
-    "investors", "portal", "dashboard", "account", "profile", "settings",
-    "administrator", "remote", "demo", "alpha", "beta", "test", "qa", "uat",
-    "staging", "dev", "api", "admin", "app", "www", "web", "site", "website",
-}
+# Redirect control
+MAX_REDIRECTS = 5                  # Maximum HTTP redirect hops to follow
+
 
 MAX_ENTITY_WORDS = 3
 ENTITY_MIN_CHARS = 2
@@ -233,45 +107,164 @@ SERVICE_LABELS_ROOT = [
 CHILD_LABELS = ["api", "dev", "test", "staging", "qa", "uat", "beta",
                 "admin", "app", "www"]
 
-LEARNING_ROLES = [
-    "api", "app", "dev", "staging", "assets", "feed", "gmr", "admin", "mail",
-    "vpn", "cdn", "www", "web", "remote", "portal", "beta", "test", "qa", "uat",
-    "ns1", "ns2",
-]
-
 EXPLICIT_SOURCES = {
     "ct", "certspotter", "otx", "anubis", "subdomain.center",
     "hackertarget", "cdx", "urlscan", "tls", "dns-record",
     "website", "js", "import", "seed",
 }
 
-# Sources that represent real discovered hostnames (CT / passive DNS / TLS).
-# Learning is fed ONLY from these — never from website slugs, brand stems,
-# service labels, or the domain's own name.
-REAL_LEARNING_SOURCES = {
-    "ct", "certspotter", "otx", "anubis", "subdomain.center",
-    "hackertarget", "cdx", "urlscan", "tls",
-}
+# --------------------------------------------------------------------------- SSRF protection
+# Maximum time (seconds) allowed for a hostname DNS resolution in the SSRF
+# hostname check. socket.getaddrinfo() has no timeout of its own, so we bound
+# it with a thread; an unresponsive name server must never block a scan.
+HOSTNAME_RESOLVE_TIMEOUT = 5.0
 
-# Vocab used to split registrable labels into words.
-# Only generic English/tech terms — no company-specific product or brand names.
-BRAND_VOCAB = {
-    "soft", "tech", "data", "net", "web", "sys", "info",
-    "global", "prime", "core", "hub", "stack", "flow", "link", "sync",
-    "node", "vault", "apex", "nova", "orbit", "pulse", "wave",
-    "spark", "flux", "mesh", "grid", "signal", "routes",
-    "soft", "ware", "lab", "labs", "group", "systems", "solutions",
-    "services", "digital", "smart", "next", "first", "best", "top",
-    "alpha", "beta", "gamma", "delta", "omega",
-}
+# Cache for is_safe_hostname() results so each unique host is DNS-checked at
+# most once per run.
+_hostname_cache: dict[str, bool] = {}
+_hostname_cache_lock = threading.Lock()
+
+
+def is_safe_url(url):
+    """Return True if `url` is an http/https URL that does not point to a
+    private/reserved IP address, localhost, or an unsafe scheme.
+
+    This prevents SSRF attacks where a malicious HTML page or JS bundle
+    could cause the tool to fetch internal metadata endpoints (e.g.
+    http://169.254.169.254/) or other non-public resources.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname or ""
+    if not host:
+        return False
+    # Reject localhost explicitly
+    if host == "localhost" or host.endswith(".localhost"):
+        return False
+    # Reject naked IP literals unless they are public.
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            return False
+    except ValueError:
+        pass  # Not an IP literal; hostname resolution will happen at connect time.
+    return True
+
+
+def _hostname_resolves_to_public(hostname: str) -> bool:
+    """Resolve `hostname` with a bounded timeout; True only if every answer
+    is a public (non-private, non-loopback, non-link-local, non-multicast,
+    non-reserved) IP address.
+
+    socket.getaddrinfo() has no timeout of its own, so the resolution runs in
+    a thread with HOSTNAME_RESOLVE_TIMEOUT. Any DNS failure or timeout is
+    treated as unsafe (do not fetch).
+    """
+    result: dict = {}
+
+    def resolve() -> None:
+        try:
+            infos = socket.getaddrinfo(hostname, None, 0, socket.SOCK_STREAM)
+            ips = []
+            for info in infos:
+                addr = info[4][0]
+                try:
+                    ips.append(ipaddress.ip_address(addr))
+                except ValueError:
+                    continue
+            result["ips"] = ips
+        except Exception as exc:  # DNS failure
+            result["error"] = exc
+
+    # socket.getaddrinfo() has no timeout; a daemon thread is joined with a
+    # deadline so an unresponsive name server can never block (or prevent exit
+    # of) the scan. Daemon threads do not keep the process alive.
+    thread = threading.Thread(target=resolve, daemon=True)
+    thread.start()
+    thread.join(timeout=HOSTNAME_RESOLVE_TIMEOUT)
+    if thread.is_alive():
+        # DNS did not return in time -> treat as unsafe (do not fetch).
+        return False
+    ips = result.get("ips")
+    if not ips:
+        return False
+    for ip in ips:
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            return False
+    return True
+
+
+def is_safe_hostname(hostname: str) -> bool:
+    """Return True if `hostname` does not resolve to a private/reserved IP.
+
+    Results are cached per hostname so each unique host is DNS-checked at most
+    once per run. If DNS fails or times out, err on the side of caution and
+    return False (do not fetch).
+    """
+    with _hostname_cache_lock:
+        cached = _hostname_cache.get(hostname)
+    if cached is not None:
+        return cached
+    result = _hostname_resolves_to_public(hostname)
+    with _hostname_cache_lock:
+        _hostname_cache[hostname] = result
+    return result
+
+
+# --------------------------------------------------------------------------- request rate limiting
+_request_times = defaultdict(deque)
+_request_lock = threading.Lock()
+
+
+def _rate_limit(hostname, wait=True):
+    """Enforce a minimum interval between requests to the same hostname.
+
+    Returns True if the request may proceed, False if rate limited.
+    If wait=True, blocks briefly to wait for the rate limit window to open.
+    """
+    now = datetime.now(timezone.utc)
+    with _request_lock:
+        times = _request_times[hostname]
+        # Drop entries older than 60 seconds
+        while times and (now - times[0]).total_seconds() > 60:
+            times.popleft()
+        if len(times) >= MAX_REQUESTS_PER_HOST:
+            if wait and times:
+                wait_time = 60.0 - (now - times[0]).total_seconds()
+                if wait_time > 0:
+                    time.sleep(min(wait_time, RATE_LIMIT_MAX_WAIT))
+                    # Re-check after waiting
+                    now = datetime.now(timezone.utc)
+                    while times and (now - times[0]).total_seconds() > 60:
+                        times.popleft()
+                    if len(times) < MAX_REQUESTS_PER_HOST:
+                        times.append(now)
+                        return True
+                return False
+            return False
+        if times:
+            elapsed = (now - times[-1]).total_seconds()
+            if elapsed < REQUEST_INTERVAL_SECONDS:
+                if wait:
+                    time.sleep(min(REQUEST_INTERVAL_SECONDS - elapsed,
+                                   RATE_LIMIT_MAX_WAIT))
+                else:
+                    return False
+        times.append(datetime.now(timezone.utc))
+        return True
 
 
 # --------------------------------------------------------------------------- small helpers
-def now_iso():
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def normalize_name(name):
+def normalize_name(name: str | None) -> str | None:
     """Lowercase, strip trailing dot and leading '*.', IDNA-normalise."""
     if not name:
         return None
@@ -285,12 +278,12 @@ def normalize_name(name):
         return None
     try:
         name = name.encode("idna").decode("ascii").lower()
-    except Exception:
+    except Exception:  # nosec B110 -- IDNA fallback is best-effort; keep original name
         pass
     return name or None
 
 
-def is_in_scope(name, domain):
+def is_in_scope(name: str | None, domain: str | None) -> bool:
     n = normalize_name(name)
     d = normalize_name(domain)
     if not n or not d:
@@ -298,67 +291,118 @@ def is_in_scope(name, domain):
     return n == d or n.endswith("." + d)
 
 
-def registrable_label(domain):
+def registrable_label(domain: str) -> str:
     d = normalize_name(domain)
     if not d:
         return ""
     return d.split(".")[0]
 
 
-def split_into_words(label):
-    """Split a registrable label into words using a small vocab.
+def split_into_words(label: str) -> list[str]:
+    """Split a registrable label into words.
 
-    Greedy longest-match against the vocab; fall back to the whole label
-    (longest partial split) when no multi-character vocab word matched,
-    rather than emitting meaningless single characters.
+    Returns the whole label as a single word (no vocab-based splitting or
+    assumed word boundaries).
     """
-    label = label.lower()
-    words = []
-    i = 0
-    n = len(label)
-    multi = False
-    while i < n:
-        matched = False
-        for length in range(min(12, n - i), 0, -1):
-            piece = label[i:i + length]
-            if piece in BRAND_VOCAB or length == 1:
-                words.append(piece)
-                if length > 1:
-                    multi = True
-                i += length
-                matched = True
-                break
-        if not matched:
-            i += 1
-    if not multi and label and len(label) > 1:
-        return [label]
-    return [w for w in words if w]
+    if not label:
+        return []
+    return [label.lower()]
 
 
-# --------------------------------------------------------------------------- network chokepoint (single mockable entry point)
-def http_get(url, timeout=HTTP_TIMEOUT, max_bytes=MAX_BODY, insecure=False, headers=None):
+# --------------------------------------------------------------------------- SSRF-safe redirect handler
+class _RedirectLimitHandler(HTTPRedirectHandler):
+    """Follow redirects but enforce a maximum count and re-validate each
+    redirect target against SSRF rules."""
+
+    def __init__(self, max_redirects: int):
+        self.max_redirects = max_redirects
+        self.redirect_count = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.redirect_count += 1
+        if self.redirect_count > self.max_redirects:
+            raise URLError(f"too many redirects (>{self.max_redirects})")
+        # Re-validate the redirect target before following it.
+        if not is_safe_url(newurl):
+            raise URLError(f"blocked: redirect to unsafe URL (SSRF protection): {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def http_get(url, timeout=HTTP_TIMEOUT, max_bytes=MAX_BODY, insecure=False,
+             headers=None, max_redirects=MAX_REDIRECTS):
     """Single HTTP GET chokepoint.
 
     Returns (status_code_or_None, body_text_or_None, error_or_None).
     Every network call in this module funnels through here so tests can mock
     http_get in one place, and so timeouts / size limits / error capture are
     consistent.
+
+    Safety properties:
+    - SSRF protection: rejects URLs that resolve to private/reserved IPs.
+    - Redirect control: follows at most `max_redirects` hops.
+    - Rate limiting: enforces REQUEST_INTERVAL_SECONDS per hostname.
+    - User-Agent: always identifies the tool; custom headers are merged, not replaced.
     """
+    # SSRF: validate the URL before any network access.
+    if not is_safe_url(url):
+        return None, None, "blocked: unsafe URL (SSRF protection)"
+
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+
+    # Defence-in-depth: is_safe_url() rejects private IP *literals*, but a
+    # hostname that DNS-resolves to a private/reserved address (DNS rebinding)
+    # would still reach urlopen(). Resolve and reject those hostnames before
+    # any socket is opened. IP literals were already handled by is_safe_url().
+    try:
+        ipaddress.ip_address(hostname)
+        is_ip_literal = True
+    except ValueError:
+        is_ip_literal = False
+    if not is_ip_literal and not is_safe_hostname(hostname):
+        return None, None, "blocked: hostname resolves to unsafe address (SSRF protection)"
+
+    # Rate limit per hostname.
+    if not _rate_limit(hostname):
+        return None, None, "blocked: rate limit exceeded for host"
+
     default_headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
     if headers:
         default_headers.update(headers)
     ctx = ssl.create_default_context()
     if insecure:
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        # Opt-in only: --insecure-api disables verification. The CLI prints a
+        # visible warning before the scan starts.
+        ctx.check_hostname = False  # nosec B311 -- opt-in --insecure-api only
+        ctx.verify_mode = ssl.CERT_NONE  # nosec B311 -- opt-in --insecure-api only
     elif HAS_CERTIFI:
         try:
             ctx.load_verify_locations(certifi.where())
-        except Exception:
+        except Exception:  # nosec B110 -- certifi optional; default context is acceptable fallback
             pass
     req = Request(url, headers=default_headers)
+    # Defense-in-depth: re-verify scheme immediately before urlopen().
+    # is_safe_url() is called above, but we re-check here so that Bandit and
+    # human reviewers can see that only http/https ever reach urlopen().
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ("http", "https"):
+        return None, None, "blocked: unsafe scheme for urlopen"
     try:
-        with urlopen(req, timeout=timeout, context=ctx) as resp:
+        # Use a custom redirect handler to enforce max_redirects and
+        # re-validate each redirect target against SSRF rules, plus an
+        # HTTPSHandler carrying the configured SSL context (certifi bundle
+        # or opt-in insecure mode). OpenerDirector.open() accepts timeout
+        # but not context, so the context is injected via the HTTPSHandler.
+        # build_opener() skips the default HTTPSHandler/HTTPRedirectHandler
+        # when our own are supplied, so these are the ones actually used.
+        https_handler = HTTPSHandler(context=ctx)
+        opener = build_opener(_RedirectLimitHandler(max_redirects),
+                              https_handler)
+        with opener.open(req, timeout=timeout) as resp:  # nosec B310 -- passive client; SSRF guarded
+            # Re-validate the final URL after all redirects.
+            final_url = resp.geturl()
+            if not is_safe_url(final_url):
+                return None, None, f"blocked: redirect to unsafe URL (SSRF protection): {final_url}"
             status = getattr(resp, "status", None)
             if status is None:
                 status = resp.getstatus()
@@ -381,130 +425,138 @@ def http_get(url, timeout=HTTP_TIMEOUT, max_bytes=MAX_BODY, insecure=False, head
 
 
 # --------------------------------------------------------------------------- passive discovery sources
-def fetch_crt_sh(domain, insecure=False):
+def fetch_crt_sh(domain: str, insecure: bool = False) -> tuple[list[str], dict[str, object | None], str | None]:
     """crt.sh certificate transparency. Two URL forms, max 2 attempts each,
     502/503/504 treated as service down (fail fast, never blocks others).
 
     Returns (names: list[str], first_seen: dict[str, datetime|None], error_or_None).
     first_seen maps hostname -> earliest certificate timestamp if available.
     """
-    names = []
-    first_seen = {}
-    forms = [
-        "https://crt.sh/?q=%25.{0}&output=json".format(domain),
-        "https://crt.sh/?q={0}&output=json".format(domain),
-    ]
-    for url in forms:
-        for _attempt in range(2):
-            status, body, err = http_get(url, timeout=CT_TIMEOUT, insecure=insecure)
-            if err is not None and status is None:
-                break
-            if status in (502, 503, 504):
-                break
-            if status == 200 and body:
-                try:
-                    data = json.loads(body)
-                except Exception:
-                    data = []
-                if data is None:
-                    data = []
-                for row in data:
-                    nv = row.get("name_value") if isinstance(row, dict) else None
-                    if not nv and isinstance(row, str):
-                        nv = row
-                    ts = None
-                    if isinstance(row, dict):
-                        ts_raw = row.get("entry_timestamp") or row.get("not_before")
-                        if ts_raw:
-                            try:
-                                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                            except Exception:
+    names: list[str] = []
+    first_seen: dict[str, object | None] = {}
+    try:
+        forms = [
+            "https://crt.sh/?q=%25.{0}&output=json".format(domain),
+            "https://crt.sh/?q={0}&output=json".format(domain),
+        ]
+        for url in forms:
+            for _attempt in range(2):
+                status, body, err = http_get(url, timeout=CT_TIMEOUT, insecure=insecure)
+                if err is not None and status is None:
+                    break
+                if status in (502, 503, 504):
+                    break
+                if status == 200 and body:
+                    try:
+                        data = json.loads(body)
+                    except Exception:
+                        data = []
+                    if data is None:
+                        data = []
+                    for row in data:
+                        nv = row.get("name_value") if isinstance(row, dict) else None
+                        if not nv and isinstance(row, str):
+                            nv = row
+                        ts = None
+                        if isinstance(row, dict):
+                            ts_raw = row.get("entry_timestamp") or row.get("not_before")
+                            if ts_raw:
                                 try:
-                                    ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
-                                    ts = ts.replace(tzinfo=timezone.utc)
+                                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
                                 except Exception:
-                                    ts = None
-                    if nv:
-                        for part in str(nv).split("\n"):
-                            nn = normalize_name(part)
-                            if nn and is_in_scope(nn, domain):
-                                names.append(nn)
-                                if nn not in first_seen or (ts and first_seen[nn] and ts < first_seen[nn]):
-                                    first_seen[nn] = ts
-                                elif nn not in first_seen:
-                                    first_seen[nn] = ts
-                return names, first_seen, None
-            break
+                                    try:
+                                        ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
+                                        ts = ts.replace(tzinfo=timezone.utc)
+                                    except Exception:
+                                        ts = None
+                        if nv:
+                            for part in str(nv).split("\n"):
+                                nn = normalize_name(part)
+                                if nn and is_in_scope(nn, domain):
+                                    names.append(nn)
+                                    if nn not in first_seen or (ts and first_seen.get(nn) and ts < first_seen.get(nn)):
+                                        first_seen[nn] = ts
+                                    elif nn not in first_seen:
+                                        first_seen[nn] = ts
+                    return names, first_seen, None
+                break
+    except Exception as e:
+        return names, first_seen, "crt.sh: {0}".format(e)
     return names, first_seen, "crt.sh: service down or no usable response"
 
 
-def fetch_crt_name(domain, insecure=False):
+def fetch_crt_name(domain: str, insecure: bool = False) -> tuple[list[str], dict[str, object | None], str | None]:
     """crt.name certificate transparency fallback (used when crt.sh is down).
 
     Returns (names: list[str], first_seen: dict[str, datetime|None], error_or_None).
     """
-    names = []
-    first_seen = {}
-    forms = [
-        "https://crt.name/?q=%25.{0}&output=json".format(domain),
-        "https://crt.name/?q={0}&output=json".format(domain),
-        "https://crt.name/api/v1/search?q={0}".format(domain),
-    ]
-    for url in forms:
-        for _attempt in range(2):
-            status, body, err = http_get(url, timeout=CT_TIMEOUT, insecure=insecure)
-            if err is not None and status is None:
-                break
-            if status in (502, 503, 504):
-                break
-            if status == 200 and body:
-                try:
-                    data = json.loads(body)
-                except Exception:
-                    data = []
-                if data is None:
-                    data = []
-                rows = data if isinstance(data, list) else data.get("data", [])
-                for row in rows:
-                    nv = row.get("name_value") or row.get("common_name") or row.get("domain") if isinstance(row, dict) else None
-                    if not nv and isinstance(row, str):
-                        nv = row
-                    ts = None
-                    if isinstance(row, dict):
-                        ts_raw = row.get("entry_timestamp") or row.get("not_before") or row.get("created_at")
-                        if ts_raw:
-                            try:
-                                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                            except Exception:
+    names: list[str] = []
+    first_seen: dict[str, object | None] = {}
+    try:
+        forms = [
+            "https://crt.name/?q=%25.{0}&output=json".format(domain),
+            "https://crt.name/?q={0}&output=json".format(domain),
+            "https://crt.name/api/v1/search?q={0}".format(domain),
+        ]
+        for url in forms:
+            for _attempt in range(2):
+                status, body, err = http_get(url, timeout=CT_TIMEOUT, insecure=insecure)
+                if err is not None and status is None:
+                    break
+                if status in (502, 503, 504):
+                    break
+                if status == 200 and body:
+                    try:
+                        data = json.loads(body)
+                    except Exception:
+                        data = []
+                    if data is None:
+                        data = []
+                    rows = data if isinstance(data, list) else data.get("data", [])
+                    for row in rows:
+                        nv = None
+                        if isinstance(row, dict):
+                            nv = row.get("name_value") or row.get("common_name") or row.get("domain")
+                        elif isinstance(row, str):
+                            nv = row
+                        ts = None
+                        if isinstance(row, dict):
+                            ts_raw = row.get("entry_timestamp") or row.get("not_before") or row.get("created_at")
+                            if ts_raw:
                                 try:
-                                    ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
-                                    ts = ts.replace(tzinfo=timezone.utc)
+                                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
                                 except Exception:
-                                    ts = None
-                    if nv:
-                        for part in str(nv).split("\n"):
-                            nn = normalize_name(part)
-                            if nn and is_in_scope(nn, domain):
-                                names.append(nn)
-                                if nn not in first_seen or (ts and first_seen[nn] and ts < first_seen[nn]):
-                                    first_seen[nn] = ts
-                                elif nn not in first_seen:
-                                    first_seen[nn] = ts
-                return names, first_seen, None
-            break
+                                    try:
+                                        ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
+                                        ts = ts.replace(tzinfo=timezone.utc)
+                                    except Exception:
+                                        ts = None
+                        if nv:
+                            for part in str(nv).split("\n"):
+                                nn = normalize_name(part)
+                                if nn and is_in_scope(nn, domain):
+                                    names.append(nn)
+                                    if nn not in first_seen or (ts and first_seen.get(nn) and ts < first_seen.get(nn)):
+                                        first_seen[nn] = ts
+                                    elif nn not in first_seen:
+                                        first_seen[nn] = ts
+                    return names, first_seen, None
+                break
+    except Exception as e:
+        return names, first_seen, "crt.name: {0}".format(e)
     return names, first_seen, "crt.name: service down or no usable response"
 
 
-def fetch_certspotter(domain, insecure=False):
+def fetch_certspotter(domain: str, insecure: bool = False) -> tuple[list[str], dict[str, object | None], str | None]:
     """Certspotter (paginated, first page primarily).
 
     Returns (names: list[str], first_seen: dict[str, datetime|None], error_or_None).
     """
-    names = []
-    first_seen = {}
+    names: list[str] = []
+    first_seen: dict[str, object | None] = {}
     url = ("https://api.certspotter.com/v1/issuances?"
            "domain={0}&include_subdomains=true&expand=dns_names").format(domain)
-    certspotter_headers = {}
+    certspotter_headers: dict[str, str] = {}
     certspotter_api_key = os.environ.get("CERTSPOTTER_API_KEY", "")
     if certspotter_api_key:
         certspotter_headers["Authorization"] = "Bearer {0}".format(certspotter_api_key)
@@ -534,7 +586,7 @@ def fetch_certspotter(domain, insecure=False):
                     nn = normalize_name(dn)
                     if nn and is_in_scope(nn, domain):
                         names.append(nn)
-                        if nn not in first_seen or (ts and first_seen[nn] and ts < first_seen[nn]):
+                        if nn not in first_seen or (ts and first_seen.get(nn) and ts < first_seen.get(nn)):
                             first_seen[nn] = ts
                         elif nn not in first_seen:
                             first_seen[nn] = ts
@@ -544,15 +596,15 @@ def fetch_certspotter(domain, insecure=False):
     return names, first_seen, None
 
 
-def fetch_otx(domain, insecure=False):
+def fetch_otx(domain: str, insecure: bool = False) -> tuple[list[str], str | None]:
     """AlienVault OTX passive DNS.
 
     Requires OTX_API_KEY environment variable or --otx-api-key argument for
     authenticated access. Without a key, OTX returns 403 and is skipped.
     """
-    names = []
+    names: list[str] = []
     url = "https://otx.alienvault.com/api/v1/indicators/domain/{0}/passive_dns".format(domain)
-    otx_headers = {}
+    otx_headers: dict[str, str] = {}
     otx_api_key = os.environ.get("OTX_API_KEY", "")
     if otx_api_key:
         otx_headers["X-OTX-API-KEY"] = otx_api_key
@@ -574,64 +626,74 @@ def fetch_otx(domain, insecure=False):
     return names, None
 
 
-def fetch_anubis(domain, insecure=False):
+def fetch_anubis(domain: str, insecure: bool = False) -> tuple[list[str], str | None]:
     """AnubisDB subdomains."""
-    names = []
-    url = "https://anubisdb.com/subdomains/{0}".format(domain)
-    status, body, err = http_get(url, timeout=HTTP_TIMEOUT, insecure=insecure)
-    if err is not None or status != 200:
-        return names, "anubis: {0}".format(err or "http {0}".format(status))
+    names: list[str] = []
     try:
-        data = json.loads(body)
-    except Exception:
-        return names, "anubis: invalid json"
-    if data is None:
-        data = []
-    if isinstance(data, list):
-        for item in data:
-            nn = normalize_name(item if isinstance(item, str) else str(item))
-            if nn and is_in_scope(nn, domain):
-                names.append(nn)
-    elif isinstance(data, dict):
-        for item in data.get("subdomains", []) or []:
-            nn = normalize_name(item)
-            if nn and is_in_scope(nn, domain):
-                names.append(nn)
+        url = "https://anubisdb.com/subdomains/{0}".format(domain)
+        status, body, err = http_get(url, timeout=HTTP_TIMEOUT, insecure=insecure)
+        if err is not None or status != 200:
+            return names, "anubis: {0}".format(err or "http {0}".format(status))
+        if body is None:
+            return names, "anubis: empty response"
+        try:
+            data = json.loads(body)
+        except Exception:
+            return names, "anubis: invalid json"
+        if data is None:
+            data = []
+        if isinstance(data, list):
+            for item in data:
+                nn = normalize_name(item if isinstance(item, str) else str(item))
+                if nn and is_in_scope(nn, domain):
+                    names.append(nn)
+        elif isinstance(data, dict):
+            for item in data.get("subdomains", []) or []:
+                nn = normalize_name(item)
+                if nn and is_in_scope(nn, domain):
+                    names.append(nn)
+    except Exception as e:
+        return names, "anubis: {0}".format(e)
     return names, None
 
 
-def fetch_subdomain_center(domain, insecure=False):
+def fetch_subdomain_center(domain: str, insecure: bool = False) -> tuple[list[str], str | None]:
     """subdomain.center API."""
-    names = []
-    url = "https://api.subdomain.center/?domain={0}".format(domain)
-    status, body, err = http_get(url, timeout=HTTP_TIMEOUT, insecure=insecure)
-    if err is not None or status != 200:
-        return names, "subdomain.center: {0}".format(err or "http {0}".format(status))
+    names: list[str] = []
     try:
-        data = json.loads(body)
-    except Exception:
-        return names, "subdomain.center: invalid json"
-    if data is None:
-        data = []
-    if isinstance(data, list):
-        for item in data:
-            nn = normalize_name(item)
-            if nn and is_in_scope(nn, domain):
-                names.append(nn)
-    elif isinstance(data, dict):
-        for key in ("subdomains", "results", "data"):
-            val = data.get(key)
-            if isinstance(val, list):
-                for item in val:
-                    nn = normalize_name(item if isinstance(item, str) else str(item))
-                    if nn and is_in_scope(nn, domain):
-                        names.append(nn)
+        url = "https://api.subdomain.center/?domain={0}".format(domain)
+        status, body, err = http_get(url, timeout=HTTP_TIMEOUT, insecure=insecure)
+        if err is not None or status != 200:
+            return names, "subdomain.center: {0}".format(err or "http {0}".format(status))
+        if body is None:
+            return names, "subdomain.center: empty response"
+        try:
+            data = json.loads(body)
+        except Exception:
+            return names, "subdomain.center: invalid json"
+        if data is None:
+            data = []
+        if isinstance(data, list):
+            for item in data:
+                nn = normalize_name(item)
+                if nn and is_in_scope(nn, domain):
+                    names.append(nn)
+        elif isinstance(data, dict):
+            for key in ("subdomains", "results", "data"):
+                val = data.get(key)
+                if isinstance(val, list):
+                    for item in val:
+                        nn = normalize_name(item if isinstance(item, str) else str(item))
+                        if nn and is_in_scope(nn, domain):
+                            names.append(nn)
+    except Exception as e:
+        return names, "subdomain.center: {0}".format(e)
     return names, None
 
 
-def fetch_hackertarget(domain, insecure=False):
+def fetch_hackertarget(domain: str, insecure: bool = False) -> tuple[list[str], str | None]:
     """HackerTarget hostsearch (returns 'host,ip' lines)."""
-    names = []
+    names: list[str] = []
     try:
         url = "https://api.hackertarget.com/hostsearch/?q={0}".format(domain)
         status, body, err = http_get(url, timeout=HTTP_TIMEOUT, insecure=insecure)
@@ -652,9 +714,9 @@ def fetch_hackertarget(domain, insecure=False):
     return names, None
 
 
-def fetch_cdx(domain, insecure=False):
+def fetch_cdx(domain: str, insecure: bool = False) -> tuple[list[str], str | None]:
     """Internet Archive CDX: hostnames embedded in archived URLs."""
-    names = []
+    names: list[str] = []
     try:
         url = "https://web.archive.org/cdx/search/cdx?url=*.{0}/*".format(domain)
         status, body, err = http_get(url, timeout=HTTP_TIMEOUT, max_bytes=MAX_BODY, insecure=insecure)
@@ -671,11 +733,11 @@ def fetch_cdx(domain, insecure=False):
     return names, None
 
 
-def fetch_urlscan(domain, insecure=False):
+def fetch_urlscan(domain: str, insecure: bool = False) -> tuple[list[str], str | None]:
     """urlscan.io search for domain."""
-    names = []
+    names: list[str] = []
     url = "https://urlscan.io/api/v1/search/?q=domain:{0}".format(domain)
-    urlscan_headers = {}
+    urlscan_headers: dict[str, str] = {}
     urlscan_api_key = os.environ.get("URLSCAN_API_KEY", "")
     if urlscan_api_key:
         urlscan_headers["API-Key"] = urlscan_api_key
@@ -717,16 +779,18 @@ PASSIVE_SOURCES = [
 ]
 
 
-def run_passive_sources(domain, insecure=False, no_ct=False, max_workers=DEFAULT_WORKERS,
-                        statuses=None):
+def run_passive_sources(domain: str, insecure: bool = False, no_ct: bool = False,
+                        max_workers: int = DEFAULT_WORKERS,
+                        statuses: dict | None = None
+                        ) -> tuple[dict[str, set[str]], dict[str, object | None]]:
     """Query every passive source in parallel. Returns dict name -> set of
     source tags that reported it, plus a first_seen dict name -> datetime.
     Logs each source clearly; one dead source never stops the run."""
-    results = defaultdict(set)
-    first_seen = {}
+    results: dict[str, set[str]] = defaultdict(set)
+    first_seen: dict[str, object | None] = {}
     lock = threading.Lock()
 
-    def run_source(tag, func):
+    def run_source(tag: str, func) -> None:
         if tag in CT_SOURCES and no_ct:
             print(f"[passive] {tag}: skipped (--no-ct)")
             if statuses is not None:
@@ -766,44 +830,48 @@ def run_passive_sources(domain, insecure=False, no_ct=False, max_workers=DEFAULT
                 fut.result()
             except KeyboardInterrupt:
                 raise
-            except Exception:
+            except Exception:  # nosec B110 -- never let one passive source abort the run
                 pass
     return dict(results), first_seen
 
 
 # --------------------------------------------------------------------------- TLS SAN harvesting
-def tls_san_names(hostname, port=443, timeout=10, insecure=False):
+def tls_san_names(hostname: str, port: int = 443, timeout: int = 10,
+                  insecure: bool = False) -> list[str]:
     """TLS handshake to port 443; return SAN DNS names."""
-    ctx = ssl.create_default_context()
-    if insecure:
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-    elif HAS_CERTIFI:
-        try:
-            ctx.load_verify_locations(certifi.where())
-        except Exception:
-            pass
-    names = []
-    with socket.create_connection((hostname, port), timeout=timeout) as sock:
-        with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
-            cert = ssock.getpeercert()
-    for key, val in cert.get("subjectAltName", ()) or ():
-        if key == "DNS":
-            nn = normalize_name(val)
-            if nn:
-                names.append(nn)
+    names: list[str] = []
+    try:
+        ctx = ssl.create_default_context()
+        if insecure:
+            ctx.check_hostname = False  # nosec B311 -- opt-in --insecure-api only
+            ctx.verify_mode = ssl.CERT_NONE  # nosec B311 -- opt-in --insecure-api only
+        elif HAS_CERTIFI:
+            try:
+                ctx.load_verify_locations(certifi.where())
+            except Exception:  # nosec B110 -- certifi optional; default context is acceptable fallback
+                pass
+        with socket.create_connection((hostname, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+                cert = ssock.getpeercert()
+        for key, val in cert.get("subjectAltName", ()) or ():
+            if key == "DNS":
+                nn = normalize_name(val)
+                if nn:
+                    names.append(nn)
+    except Exception:  # nosec B110 -- TLS SAN harvest is best-effort; TLS failure must not abort the scan
+        pass
     return names
 
 
 # --------------------------------------------------------------------------- DNS resolution (mockable in tests)
-def resolve_hostname(name):
+def resolve_hostname(name: str) -> tuple[list[str], str | None]:
     """Resolve A/AAAA/CNAME. Returns (ips:list[str], cname:str|None).
 
     Without dnspython we use socket.getaddrinfo for A/AAAA and attempt a
     CNAME lookup only when dnspython is installed. Raises OSError on failure.
     """
-    ips = []
-    cname = None
+    ips: list[str] = []
+    cname: str | None = None
     if HAS_DNS:
         try:
             answers = dns.resolver.resolve(name, "CNAME", lifetime=10)
@@ -815,18 +883,18 @@ def resolve_hostname(name):
             answers = dns.resolver.resolve(name, "A", lifetime=10)
             for r in answers:
                 ips.append(r.address)
-        except Exception:
+        except Exception:  # nosec B110 -- one DNS record type failing is non-fatal
             pass
         try:
             answers = dns.resolver.resolve(name, "AAAA", lifetime=10)
             for r in answers:
                 ips.append(r.address)
-        except Exception:
+        except Exception:  # nosec B110 -- one DNS record type failing is non-fatal
             pass
     else:
         try:
             infos = socket.getaddrinfo(name, None, 0, socket.SOCK_STREAM)
-            seen = set()
+            seen: set[str] = set()
             for info in infos:
                 addr = info[4][0]
                 if addr not in seen:
@@ -839,14 +907,14 @@ def resolve_hostname(name):
     return ips, cname
 
 
-def detect_wildcard(domain, workers=8):
+def detect_wildcard(domain: str, workers: int = 8) -> set[str]:
     """Probe random labels beneath `domain`; return the set of IPs that
     resolve for random labels (the wildcard answer) or an empty set."""
-    import random
-    wild_ips = set()
-    trials = []
+    import secrets
+    wild_ips: set[str] = set()
+    trials: list[str] = []
     for _ in range(5):
-        label = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(16))
+        label = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(16))
         trials.append("{0}.{1}".format(label, domain))
     try:
         with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -855,7 +923,7 @@ def detect_wildcard(domain, workers=8):
                 try:
                     ips, _ = fut.result()
                     wild_ips.update(ips)
-                except Exception:
+                except Exception:  # nosec B110 -- one failed wildcard probe is non-fatal
                     pass
     except KeyboardInterrupt:
         raise
@@ -951,7 +1019,7 @@ def analyze_website(hostname, domain, insecure=False):
         parser = _LinkExtractor()
         try:
             parser.feed(html_text)
-        except Exception:
+        except Exception:  # nosec B110 -- malformed HTML must not abort link extraction
             pass
         for u in parser.hrefs + parser.scripts:
             abs_url = urljoin(source_url, u)
@@ -962,7 +1030,9 @@ def analyze_website(hostname, domain, insecure=False):
             elif h and p.scheme in ("http", "https") and "." in h:
                 # Keep external company/product domains as related leads; do not
                 # validate or crawl them from this in-scope investigation.
-                if not any(x in h for x in ("facebook.com", "linkedin.com", "twitter.com", "instagram.com", "youtube.com")):
+                social = ("facebook.com", "linkedin.com", "twitter.com",
+                          "instagram.com", "youtube.com")
+                if not any(x in h for x in social):
                     external_domains.add(h)
             if h == normalize_name(hostname) and p.scheme in ("http", "https"):
                 clean_url = p._replace(fragment="").geturl()
@@ -982,7 +1052,7 @@ def analyze_website(hostname, domain, insecure=False):
         if body:
             try:
                 handle_html(body, url)
-            except Exception:
+            except Exception:  # nosec B110 -- one page parse failure must not abort crawling
                 pass
 
     # Homepage is consumed by the same queue as every other page so its links
@@ -1034,12 +1104,12 @@ def analyze_website(hostname, domain, insecure=False):
         crawled += 1
         try:
             handle_html(body, url)
-        except Exception:
+        except Exception:  # nosec B110 -- one page parse failure must not abort crawling
             pass
         parser = _LinkExtractor()
         try:
             parser.feed(body)
-        except Exception:
+        except Exception:  # nosec B110 -- malformed HTML must not abort link extraction
             pass
         for u in parser.hrefs:
             abs_url = urljoin(url, u)
@@ -1069,15 +1139,15 @@ def analyze_website(hostname, domain, insecure=False):
     return sorted(hostnames), entities, keywords, sorted(external_domains)
 
 
-def derive_entities(texts):
+def derive_entities(texts: list[str]) -> list[tuple[str, str]]:
     """Turn nav/button/heading/slug text into entity candidates.
 
     Returns list of (joined, hyphenated) tuples. Noise (phones, hex hashes,
     digit-heavy strings, single generic words, long marketing phrases) is
     filtered out. Entities are never rank-truncated.
     """
-    out = []
-    seen_joined = set()
+    out: list[tuple[str, str]] = []
+    seen_joined: set[str] = set()
     for raw in texts:
         if not raw:
             continue
@@ -1098,12 +1168,6 @@ def derive_entities(texts):
             continue
         if re.fullmatch(r"[\d\s\-\+\(\)]{7,}", joined):
             continue
-        low = text.lower()
-        if len(words) == 1 and joined in GENERIC_WORDS:
-            continue
-        # filter out CSS/HTML/SVG/JS noise terms
-        if joined in ENTITY_NOISE:
-            continue
         if joined in seen_joined:
             continue
         seen_joined.add(joined)
@@ -1112,15 +1176,15 @@ def derive_entities(texts):
 
 
 # --------------------------------------------------------------------------- DNS record mining
-def dns_mine(hostname):
+def dns_mine(hostname: str) -> list[str]:
     """Hostnames found inside MX/NS/TXT/SOA records (dnspython only)."""
     if not HAS_DNS:
         return []
-    names = []
+    names: list[str] = []
     for rtype in ("MX", "NS", "TXT", "SOA"):
         try:
             answers = dns.resolver.resolve(hostname, rtype, lifetime=10)
-        except Exception:
+        except Exception:  # nosec B112 -- one DNS record type failing must not skip other record types
             continue
         for r in answers:
             target = getattr(r, "exchange", None) or getattr(r, "target", None)
@@ -1145,45 +1209,13 @@ def dns_mine(hostname):
     return names
 
 
-# --------------------------------------------------------------------------- pattern learning
-def learn_patterns(evidenced_names, domain, max_rounds=2):
-    """From evidenced names learn role/product conventions and propose
-    role-<product> / <product>-role / bare-product candidates.
-
-    Only hyphenated hostnames (e.g. api-retaileye) may teach roles/products.
-    Single-label hosts (adm, app, www, mb, visakhaiccc) must NEVER become
-    product tokens.
-    """
-    products = set()
-    roles = set()
-    for name in evidenced_names:
-        label = normalize_name(name).split(".")[0]
-        # Only hyphenated labels teach conventions; single labels are ignored.
-        if "-" not in label:
-            continue
-        left, right = label.split("-", 1)
-        # Convention: left token is a role, right token is a product.
-        # Both must be alphabetic to be meaningful.
-        if left.isalpha():
-            roles.add(left)
-        if right.isalpha():
-            products.add(right)
-
-    learned_candidates = set()
-    for _ in range(max_rounds):
-        for prod in products:
-            learned_candidates.add("{0}.{1}".format(prod, domain))
-            for role in (roles | set(LEARNING_ROLES)):
-                learned_candidates.add("{0}-{1}.{2}".format(role, prod, domain))
-                learned_candidates.add("{1}-{0}.{2}".format(prod, role, domain))
-    return learned_candidates, sorted(roles), sorted(products)
-
-
 # --------------------------------------------------------------------------- candidate generation
-def generate_candidates(domain, validated_hosts, entities, seeds, wordlist_names,
-                        imported_names, learned_candidates, max_candidates):
+def generate_candidates(domain: str, validated_hosts: list[str],
+                        entities: list[tuple[str, str]], seeds: list[str],
+                        wordlist_names: list[str], imported_names: list[str],
+                        max_candidates: int) -> dict[str, set[str]]:
     """Build the candidate set tagged by origin. Returns dict name -> set(origins)."""
-    candidates = defaultdict(set)
+    candidates: dict[str, set[str]] = defaultdict(set)
 
     # website entities (beneath hosts are handled in the BFS; here we keep the
     # root-level entity forms too)
@@ -1215,12 +1247,6 @@ def generate_candidates(domain, validated_hosts, entities, seeds, wordlist_names
         if nn and is_in_scope(nn, domain):
             candidates[nn].add("wordlist")
 
-    # learned candidates (already fully qualified names)
-    for cand in learned_candidates:
-        nn = normalize_name(cand)
-        if nn and is_in_scope(nn, domain):
-            candidates[nn].add("learning")
-
     # generic labels beneath each confirmed host
     for host in validated_hosts:
         if host == domain:
@@ -1231,10 +1257,10 @@ def generate_candidates(domain, validated_hosts, entities, seeds, wordlist_names
             if nn and is_in_scope(nn, domain):
                 candidates[nn].add("child label")
 
-    # cap candidates (never truncate seed / import / wordlist / learning)
+    # cap candidates (never truncate seed / import / wordlist)
     if len(candidates) > max_candidates:
         ordered = sorted(candidates.items(),
-                         key=lambda kv: (0 if kv[1] & {"seed", "import", "wordlist", "learning"} else 1,
+                         key=lambda kv: (0 if kv[1] & {"seed", "import", "wordlist"} else 1,
                                          kv[0]))
         candidates = dict(ordered[:max_candidates])
 
@@ -1242,12 +1268,16 @@ def generate_candidates(domain, validated_hosts, entities, seeds, wordlist_names
 
 
 # --------------------------------------------------------------------------- validation
-def validate_name(name, parent_domain, wildcard_ips, explicit):
+def validate_name(name: str, parent_domain: str, wildcard_ips: set[str],
+                  explicit: bool) -> tuple[list[str], str | None, bool]:
     """Validate a name via DNS.
 
     Returns (ips, cname, confirmed). confirmed=False means the name only
     matches a wildcard answer without explicit evidence (not an asset).
     Raises OSError if it does not resolve.
+
+    A hostname is VALIDATED only if DNS resolves AND it does not merely match
+    a wildcard answer without explicit evidence (CT/passive/TLS/website/etc.).
     """
     ips, cname = resolve_hostname(name)
     if wildcard_ips and set(ips) <= set(wildcard_ips) and not explicit:
@@ -1257,40 +1287,43 @@ def validate_name(name, parent_domain, wildcard_ips, explicit):
 
 # --------------------------------------------------------------------------- engine
 class Engine:
-    def __init__(self, domain, args):
+    def __init__(self, domain: str, args: argparse.Namespace) -> None:
         self.domain = normalize_name(domain)
         self.args = args
         self.lock = threading.RLock()
 
         # name -> node dict (VALIDATED assets)
-        self.nodes = {}
+        self.nodes: dict[str, dict] = {}
         # name -> lead dict (UNVERIFIED)
-        self.leads = {}
-        self.external_domains = {}
+        self.leads: dict[str, dict] = {}
+        self.external_domains: dict[str, dict] = {}
         # pending observations awaiting validation
-        self.pending = {}
-        self.order = []
+        self.pending: dict[str, dict] = {}
+        self.order: list[str] = []
         self.blind_guesses = 0
-        self.blind_guess_names = set()
+        self.blind_guess_names: set[str] = set()
 
-        self.wildcard_cache = {}
-        self.stats = {
+        self.wildcard_cache: dict[str, set[str]] = {}
+        self.stats: dict[str, int | dict] = {
             "validated": 0,
             "unverified_leads": 0,
             "blind_guesses": 0,
             "sources": {},
         }
         # Per-origin candidate stats: {origin: {generated, tested, resolved, unresolved}}
-        self.origin_stats = defaultdict(lambda: {"generated": 0, "tested": 0,
-                                                  "resolved": 0, "unresolved": 0})
+        self.origin_stats: dict[str, dict[str, int]] = defaultdict(
+            lambda: {"generated": 0, "tested": 0, "resolved": 0, "unresolved": 0})
         # first_seen timestamps from CT/passive sources
-        self.first_seen = {}
+        self.first_seen: dict[str, object | None] = {}
 
         self.insecure = bool(getattr(args, "insecure_api", False))
+        self.new_cutoff: datetime | None = None
 
     # -- observation --------------------------------------------------------
-    def observe(self, name, parent=None, source=None, detail=None, explicit=False,
-                first_seen=None):
+    def observe(self, name: str, parent: str | None = None,
+                source: str | None = None, detail: str | None = None,
+                explicit: bool = False,
+                first_seen: datetime | None = None) -> None:
         nn = normalize_name(name)
         if not nn:
             return
@@ -1316,12 +1349,14 @@ class Engine:
                 if prev is None or first_seen < prev:
                     self.first_seen[nn] = first_seen
 
-    def _wildcard_ips(self, parent_domain):
+    def _wildcard_ips(self, parent_domain: str) -> set[str]:
         if parent_domain not in self.wildcard_cache:
             self.wildcard_cache[parent_domain] = detect_wildcard(parent_domain)
         return self.wildcard_cache[parent_domain]
 
-    def _make_node(self, name, parent, origin, details, ips, cname):
+    def _make_node(self, name: str, parent: str | None, origin: list[str],
+                   details: list[tuple[str, str]], ips: list[str],
+                   cname: str | None) -> None:
         with self.lock:
             if name in self.nodes:
                 node = self.nodes[name]
@@ -1342,7 +1377,8 @@ class Engine:
                 "ips": list(ips) if ips else [], "cname": cname,
             }
 
-    def _make_lead(self, name, rec, reason=None, ips=None, cname=None):
+    def _make_lead(self, name: str, rec: dict, reason: str | None = None,
+                   ips: list[str] | None = None, cname: str | None = None) -> None:
         with self.lock:
             if name in self.leads:
                 lead = self.leads[name]
@@ -1360,7 +1396,7 @@ class Engine:
                 "cname": cname, "error": None,
             }
 
-    def flush_pending_as_leads(self):
+    def flush_pending_as_leads(self) -> None:
         """Convert any still-pending observed names (with evidence) into
         unverified leads so nothing fetched is ever thrown away."""
         with self.lock:
@@ -1370,7 +1406,7 @@ class Engine:
             if rec["sources"]:
                 self._make_lead(name, rec, reason="interrupted before validation")
 
-    def validate_pending(self):
+    def validate_pending(self) -> None:
         """Move pending names to validated nodes or unverified leads."""
         with self.lock:
             to_validate = list(self.pending.items())
@@ -1379,7 +1415,9 @@ class Engine:
             # still-unprocessed names in pending (they are later flushed as leads
             # instead of being thrown away).
 
-        def do_one(item):
+        def do_one(
+            item: tuple[str, dict],
+        ) -> tuple[str, dict, list[str] | None, str | None, bool, str | None]:
             name, rec = item
             parent = rec["parent"] or self.domain
             try:
@@ -1401,7 +1439,7 @@ class Engine:
                         name, rec, ips, cname, confirmed, err = fut.result()
                     except KeyboardInterrupt:
                         raise
-                    except Exception:
+                    except Exception:  # nosec B112 -- one validation failure must not abort the batch
                         continue
                     with self.lock:
                         self.pending.pop(name, None)
@@ -1475,7 +1513,7 @@ class Engine:
         if args.wordlist:
             try:
                 with open(args.wordlist, "r", encoding="utf-8") as f:
-                    wordlist_names = [l.strip() for l in f if l.strip()]
+                    wordlist_names = [line.strip() for line in f if line.strip()]
             except OSError as e:
                 print(f"[warn] could not read wordlist {args.wordlist}: {e}")
         imported_names = []
@@ -1497,24 +1535,23 @@ class Engine:
         else:
             self.new_cutoff = None
 
-        if not args.no_ct:
-            source_status = self.stats.setdefault("source_status", {})
-            passive_result = run_passive_sources(domain, insecure=self.insecure,
-                                                 no_ct=args.no_ct, max_workers=args.workers,
-                                                 statuses=source_status)
-            # New run_passive_sources returns (results, first_seen)
-            if isinstance(passive_result, tuple) and len(passive_result) == 2:
-                passive, passive_first_seen = passive_result
-            else:
-                passive, passive_first_seen = passive_result, {}
-            for name, srcs in passive.items():
-                explicit = bool(srcs & EXPLICIT_SOURCES)
-                parent = self._nearest_validated_ancestor(name)
-                fs = passive_first_seen.get(name)
-                for s in srcs:
-                    self.observe(name, parent=parent, source=s,
-                                 detail="{0} passive source".format(s),
-                                 explicit=explicit, first_seen=fs)
+        source_status = self.stats.setdefault("source_status", {})
+        passive_result = run_passive_sources(
+            domain, insecure=self.insecure, no_ct=args.no_ct,
+            max_workers=args.workers, statuses=source_status)
+        # New run_passive_sources returns (results, first_seen)
+        if isinstance(passive_result, tuple) and len(passive_result) == 2:
+            passive, passive_first_seen = passive_result
+        else:
+            passive, passive_first_seen = passive_result, {}
+        for name, srcs in passive.items():
+            explicit = bool(srcs & EXPLICIT_SOURCES)
+            parent = self._nearest_validated_ancestor(name)
+            fs = passive_first_seen.get(name)
+            for s in srcs:
+                self.observe(name, parent=parent, source=s,
+                             detail="{0} passive source".format(s),
+                             explicit=explicit, first_seen=fs)
         else:
             print("[passive] certificate-transparency sources skipped (--no-ct)")
             self.stats["source_status"] = {
@@ -1562,8 +1599,9 @@ class Engine:
             # Website analysis
             if not args.no_web:
                 try:
-                    whosts, entities, _keywords, externals = analyze_website(host, domain,
-                                                                  insecure=self.insecure)
+                    whosts, entities, _keywords, externals = analyze_website(
+                        host, domain, insecure=self.insecure
+                    )
                     print(f"[web] {host}: {len(whosts)} hostnames, {len(entities)} entities")
                     if entities:
                         ent_names = [e[0] for e in entities[:200]]
@@ -1620,33 +1658,12 @@ class Engine:
                     if child not in investigated:
                         queue.append((child, depth + 1))
 
-        # ---- pattern learning (root, up to 2 rounds) ----
-        # Only learn from real hostnames discovered via CT / passive DNS / TLS.
-        # Never learn from website slugs, brand stems, service labels, or the
-        # domain's own name.
-        real_evidenced = set()
-        with self.lock:
-            for name, node in self.nodes.items():
-                if name == self.domain:
-                    continue
-                if any(s in REAL_LEARNING_SOURCES for s, _d in node["evidence"]):
-                    real_evidenced.add(name)
-            for name, lead in self.leads.items():
-                if any(s in REAL_LEARNING_SOURCES for s, _d in lead["evidence"]):
-                    real_evidenced.add(name)
-        learned_candidates, roles, products = learn_patterns(
-            real_evidenced, domain, max_rounds=2)
-        self.stats["learned_roles"] = roles
-        self.stats["learned_products"] = products
-        print(f"[learning] roles={roles} products={products} "
-              f"-> {len(learned_candidates)} candidate(s)")
-
         # ---- candidate generation ----
         all_entities = []
         # gather website entities discovered so far from leads/nodes evidence
         candidates = generate_candidates(
             domain, list(self.nodes.keys()), all_entities, seeds, wordlist_names,
-            imported_names, learned_candidates, max_candidates)
+            imported_names, max_candidates)
 
         for name, origins in candidates.items():
             explicit = bool(origins & EXPLICIT_SOURCES)
@@ -1769,10 +1786,6 @@ class Engine:
             "unverified_leads": [],
             "external_related_domains": [],
             "shared_infrastructure": [],
-            "learned_patterns": {
-                "roles": self.stats.get("learned_roles", []),
-                "products": self.stats.get("learned_products", []),
-            },
             "sources": self.stats["sources"],
             "source_status": self.stats.get("source_status", {}),
             "origin_stats": {k: dict(v) for k, v in self.origin_stats.items()},
@@ -1783,6 +1796,8 @@ class Engine:
         with self.lock:
             for name in sorted(self.nodes):
                 node = self.nodes[name]
+                if not node.get("validated", False):
+                    continue
                 report["validated_assets"].append({
                     "hostname": name,
                     "confidence": "high",
@@ -1803,8 +1818,9 @@ class Engine:
                                  for s, d in lead["evidence"]],
                     "reason": lead["reason"],
                 })
-            report["external_related_domains"] = [self.external_domains[k]
-                                                   for k in sorted(self.external_domains)]
+            report["external_related_domains"] = [
+                self.external_domains[k] for k in sorted(self.external_domains)
+            ]
         groups = defaultdict(list)
         with self.lock:
             for name, node in self.nodes.items():
@@ -1874,8 +1890,12 @@ def render_tree(root, children_map, annotate_fn=None, ascii=False):
     (the caller is responsible for sorting); the renderer preserves the order
     given. Box-drawing style by default; --ascii uses |-- / `-- / |."""
     style = ASCII_STYLE if ascii else BOX
-    VERT = style["vert"]; TEE = style["tee"]; LAST = style["last"]
-    INDENT = style["indent"]; INDENT_LAST = style["indent_last"]; SEP = style["sep"]
+    VERT = style["vert"]
+    TEE = style["tee"]
+    LAST = style["last"]
+    INDENT = style["indent"]
+    INDENT_LAST = style["indent_last"]
+    SEP = style["sep"]
 
     lines = [root]
     top_level = list(children_map.get(root, []))
@@ -1921,11 +1941,11 @@ def write_csv(report, path):
                 a["parent"] or "", ", ".join(a["dns"]["ips"]),
                 a["dns"]["cname"] or "", "DNS-validated asset",
             ])
-        for l in report["unverified_leads"]:
+        for lead in report["unverified_leads"]:
             w.writerow([
-                "Unverified", l["hostname"], ", ".join(l["origin"]),
-                l["parent"] or "", "", "",
-                l["reason"] or "no DNS record",
+                "Unverified", lead["hostname"], ", ".join(lead["origin"]),
+                lead["parent"] or "", "", "",
+                lead["reason"] or "no DNS record",
             ])
 
 
@@ -1956,9 +1976,9 @@ def write_txt(report, path):
     out.append("")
     out.append("UNVERIFIED LEADS")
     out.append("-" * 40)
-    for l in report["unverified_leads"]:
-        out.append(f"? {l['hostname']}  parent={l['parent'] or '-'} "
-                   f"origin={','.join(l['origin'])} reason={l['reason'] or '-'}")
+    for lead in report["unverified_leads"]:
+        out.append(f"? {lead['hostname']}  parent={lead['parent'] or '-'} "
+                   f"origin={','.join(lead['origin'])} reason={lead['reason'] or '-'}")
     if report.get("external_related_domains"):
         out.append("")
         out.append("EXTERNAL RELATED DOMAINS (not validated or crawled)")
@@ -1973,7 +1993,10 @@ def write_txt(report, path):
             out.append(f"{key}: {', '.join(report['scan_changes'].get(key, [])) or '-'}")
     if report.get("new_subdomains"):
         out.append("")
-        out.append(f"NEW SUBDOMAINS (certs issued within last {report.get('new_subdomains_count', len(report['new_subdomains']))} day(s))")
+        out.append(
+            f"NEW SUBDOMAINS (certs issued within last "
+            f"{report.get('new_subdomains_count', len(report['new_subdomains']))} day(s))"
+        )
         out.append("-" * 40)
         for n in report["new_subdomains"]:
             out.append(f"+ {n}")
@@ -1990,11 +2013,6 @@ def write_txt(report, path):
     out.append("-" * 40)
     for g in report["shared_infrastructure"]:
         out.append(f"{','.join(g['ips'])} cname={g['cname'] or '-'} -> {','.join(g['hosts'])}")
-    out.append("")
-    out.append("LEARNED PATTERNS")
-    out.append("-" * 40)
-    out.append(f"roles : {','.join(report['learned_patterns']['roles']) or '-'}")
-    out.append(f"products: {','.join(report['learned_patterns']['products']) or '-'}")
     out.append("")
     out.append("SOURCE COUNTS")
     out.append("-" * 40)
@@ -2030,11 +2048,11 @@ def write_xlsx(report, path):
     ws2.append(h2)
     for cell in ws2[1]:
         cell.font = Font(bold=True)
-    for l in report["unverified_leads"]:
+    for lead in report["unverified_leads"]:
         ev = "; ".join("{0}={1}".format(e["source"], e["detail"])
-                       for e in l["evidence"])
-        ws2.append([l["hostname"], l["parent"] or "", ", ".join(l["origin"]),
-                    l["reason"] or "", ev])
+                       for e in lead["evidence"])
+        ws2.append([lead["hostname"], lead["parent"] or "", ", ".join(lead["origin"]),
+                    lead["reason"] or "", ev])
     ws2.freeze_panes = "A2"
     ws2.auto_filter.ref = ws2.dimensions
 
@@ -2150,7 +2168,7 @@ def _load_env():
                     val = val.strip().strip('"').strip("'")
                     if key and key not in os.environ:
                         os.environ[key] = val
-    except Exception:
+    except Exception:  # nosec B110 -- .env parsing must never fail the tool
         pass
 
 
@@ -2160,7 +2178,7 @@ def main(argv=None):
 
     try:
         sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
+    except Exception:  # nosec B110 -- best-effort stdout encoding
         pass
 
     if args.insecure_api:
@@ -2183,7 +2201,7 @@ def main(argv=None):
         print("\n[engine] Ctrl+C received; exporting partial results...")
         try:
             engine.flush_pending_as_leads()
-        except Exception:
+        except Exception:  # nosec B110 -- best-effort partial export on Ctrl+C
             pass
         report = engine._build_report()
 
@@ -2225,13 +2243,13 @@ def main(argv=None):
         print(line)
 
     # ---- print full website product leads list ----
-    wp_leads = [l for l in report["unverified_leads"]
-                if "website product" in l["origin"]]
+    wp_leads = [lead for lead in report["unverified_leads"]
+                if "website product" in lead["origin"]]
     print("\nUNVERIFIED LEADS - website products (no DNS record)")
     print("-" * 40)
     if wp_leads:
-        for l in wp_leads:
-            print(f"? {l['hostname']}  [{','.join(l['origin'])}]  reason={l['reason'] or '-'}")
+        for lead in wp_leads:
+            print(f"? {lead['hostname']}  [{','.join(lead['origin'])}]  reason={lead['reason'] or '-'}")
     else:
         print("(none)")
 
@@ -2239,16 +2257,16 @@ def main(argv=None):
     if args.show_unverified and report["unverified_leads"]:
         print("\nUNVERIFIED LEADS (all)")
         print("-" * 40)
-        for l in report["unverified_leads"]:
-            print(f"? {l['hostname']}  [{','.join(l['origin'])}]")
+        for lead in report["unverified_leads"]:
+            print(f"? {lead['hostname']}  [{','.join(lead['origin'])}]")
 
     # ---- print new subdomains section ----
     new_subs = report.get("new_subdomains", [])
     if new_subs:
-        print(f"\nNEW SUBDOMAINS (certs issued within last {report.get('new_subdomains_count', len(new_subs))} day(s))")
+        new_count = report.get("new_subdomains_count", len(new_subs))
+        print(f"\nNEW SUBDOMAINS (certs issued within last {new_count} day(s))")
         print("-" * 40)
         for n in new_subs:
-            ts = report.get("new_cutoff")
             print(f"+ {n}")
 
     tee.close()
@@ -2288,8 +2306,10 @@ def persist_sqlite(db_path, report):
         changes = {
             "new": sorted(n for n in current if n not in previous),
             "removed": sorted(n for n in previous if n not in current),
-            "changed": sorted(n for n in current.keys() & previous.keys()
-                               if current[n] != previous[n]),
+            "changed": sorted(
+                n for n in current.keys() & previous.keys()
+                if current[n] != previous[n]
+            ),
         }
         cur.execute("INSERT INTO scans(root,timestamp) VALUES (?,?)",
                     (report["root"], report["timestamp"]))
@@ -2297,25 +2317,38 @@ def persist_sqlite(db_path, report):
         cur.executemany("INSERT INTO scan_assets VALUES (?,?,?,?)",
                         [(scan_id, n, s, f) for n, (s, f) in current.items()])
         # Preserve legacy latest-run tables for existing consumers.
-        cur.execute("CREATE TABLE IF NOT EXISTS nodes (hostname TEXT PRIMARY KEY,parent TEXT,validated INTEGER,origin TEXT,ips TEXT,cname TEXT)")
-        cur.execute("CREATE TABLE IF NOT EXISTS evidence (id INTEGER PRIMARY KEY AUTOINCREMENT,hostname TEXT,source TEXT,detail TEXT)")
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS nodes (hostname TEXT PRIMARY KEY, "
+            "parent TEXT, validated INTEGER, origin TEXT, ips TEXT, cname TEXT)"
+        )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS evidence (id INTEGER PRIMARY KEY "
+            "AUTOINCREMENT, hostname TEXT, source TEXT, detail TEXT)"
+        )
         cur.execute("DELETE FROM nodes")
         cur.execute("DELETE FROM evidence")
         for a in report["validated_assets"]:
-            cur.execute("INSERT INTO nodes VALUES (?,?,?,?,?,?)",
+            # Skip unvalidated hosts (defensive: validated_assets should only
+            # contain validated hosts, but be defensive in case of bad input)
+            if not a["dns"].get("ips"):
+                continue
+            # INSERT OR REPLACE keeps the legacy nodes table idempotent across
+            # repeated scans of the same host (defensive against UNIQUE
+            # constraint failures on the hostname primary key).
+            cur.execute("INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?)",
                         (a["hostname"], a["parent"], 1,
                          ",".join(a["origin"]), ",".join(a["dns"]["ips"]),
                          a["dns"]["cname"] or ""))
             for e in a["evidence"]:
                 cur.execute("INSERT INTO evidence (hostname, source, detail) VALUES (?,?,?)",
                             (a["hostname"], e["source"], e["detail"]))
-        for l in report["unverified_leads"]:
+        for lead in report["unverified_leads"]:
             cur.execute("INSERT INTO nodes VALUES (?,?,?,?,?,?)",
-                        (l["hostname"], l["parent"], 0,
-                         ",".join(l["origin"]), "", l["reason"] or ""))
-            for e in l["evidence"]:
+                        (lead["hostname"], lead["parent"], 0,
+                         ",".join(lead["origin"]), "", lead["reason"] or ""))
+            for e in lead["evidence"]:
                 cur.execute("INSERT INTO evidence (hostname, source, detail) VALUES (?,?,?)",
-                            (l["hostname"], e["source"], e["detail"]))
+                            (lead["hostname"], e["source"], e["detail"]))
         conn.commit()
         changes["scan_id"] = scan_id
         return changes
