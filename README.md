@@ -50,16 +50,18 @@ Performs a TLS handshake to port 443 of each confirmed host and reads certificat
 ### Stage 3 — Website Analysis
 Fetches `/`, `/robots.txt`, `/sitemap.xml`, crawls up to ~40 same-host pages, and inspects up to ~12 JS bundles. Extracts:
 - **Hostnames** from HTML/JS (including escaped slashes)
-- **Product/service entities** from nav anchors, buttons, headings (≤3 words), and URL path slugs. Each entity becomes both joined (`blurasaga`) and hyphenated (`blura-saga`) candidate forms.
 
 ### Stage 4 — DNS Record Mining
 Extracts hostnames from MX, NS, TXT, and SOA records (requires `dnspython`).
 
 ### Stage 5 — Pattern Learning
-From verified hyphenated hostnames (e.g. `api-retaileye`), learns role/product conventions:
-- `api-retaileye` → role=`api`, product=`retaileye`
-- `assets-origin` → role=`assets`, product=`origin`
+From verified hyphenated hostnames (e.g. `api-service-alpha`), learns role/product conventions:
+
+- `api-service-alpha` → role=`api`, product=`service-alpha`
+- `assets-primary` → role=`assets`, product=`primary`
 - Generates `role-product` and `product-role` candidates across up to 2 learning rounds.
+
+Single-label hostnames (e.g. `adm`, `app`, `www`, `mb`) are **never** used as product tokens.
 
 Single-label hostnames (e.g. `adm`, `app`, `www`, `mb`) are **never** used as product tokens.
 
@@ -236,8 +238,6 @@ Only run against domains you own or are authorised to assess.
 [passive] certspotter: OK - 36 name(s)
 [passive] hackertarget: OK - 9 name(s)
 [passive] cdx: OK - 1632 name(s)
-[learning] roles=['api', 'assets', 'feed', 'gmr'] products=['origin', 'retaileye'] -> 44 candidate(s)
-[origin-stats] generated / tested / resolved / unresolved
 ...
 
 12 validated | 156 unverified leads | 0 blind guesses did not resolve
