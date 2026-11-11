@@ -1,6 +1,6 @@
 # Subdomain Discovery and Intelligence Engine
 
-A passive, domain-agnostic subdomain discovery and intelligence CLI written in Python. It builds a hierarchical tree of **validated subdomains** with parent-child relationships, evidence sources, and a separate list of **unverified leads** — for any domain you own or are authorised to assess.
+A passive, subdomain discovery and intelligence CLI written in Python. It builds a hierarchical tree of **validated subdomains** with parent-child relationships, evidence sources, and a separate list of **unverified leads** — for any domain you own or are authorised to assess.
 
 ---
 
